@@ -247,6 +247,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.ssd_streaming = true;
+        } else if (!strcmp(arg, "--kv-cache-fp8")) {
+            setenv("DS4_KV_CACHE_FP8", "1", 1);
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {

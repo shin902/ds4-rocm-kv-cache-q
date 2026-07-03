@@ -1,6 +1,90 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
 #include "../ds4_server.c"
+
+/* ROCm packed FP8 compressed-KV cache CPU reference, defined in ds4.c
+ * (linked in via CORE_OBJS) but not declared in any public header since it
+ * is an internal helper.  Forward-declared here so the standalone
+ * pack/unpack round-trip test below can call it without a GPU or a loaded
+ * model. */
+void dsv4_fp8_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_t n_rot);
+uint64_t dsv4_fp8_kv_packed_row_bytes_cpu(uint32_t head_dim, uint32_t n_rot);
+void dsv4_fp8_kv_pack_row_cpu(const float *x, uint32_t head_dim, uint32_t n_rot, uint8_t *row_out);
+void dsv4_fp8_kv_unpack_row_cpu(const uint8_t *row_in, uint32_t head_dim, uint32_t n_rot, float *x_out);
+
+static void test_fp8_kv_pack_roundtrip(void) {
+    /* Matches the shape ds4.c actually uses (DS4_N_HEAD_DIM=512,
+     * DS4_N_ROT=64) plus a couple of edge shapes, so the 64-wide block math
+     * and RoPE-tail split are both exercised. */
+    static const uint32_t head_dims[] = {512u, 128u, 64u};
+    static const uint32_t n_rots[] = {64u, 0u, 64u};
+    uint64_t rng = 0x9e3779b97f4a7c15ull;
+
+    for (size_t shape = 0; shape < sizeof(head_dims) / sizeof(head_dims[0]); shape++) {
+        const uint32_t head_dim = head_dims[shape];
+        const uint32_t n_rot = n_rots[shape];
+        const uint32_t n_nope = head_dim - n_rot;
+        float *row = xmalloc((size_t)head_dim * sizeof(float));
+        float *expected = xmalloc((size_t)head_dim * sizeof(float));
+        float *got = xmalloc((size_t)head_dim * sizeof(float));
+        float *got2 = xmalloc((size_t)head_dim * sizeof(float));
+        const uint64_t row_bytes = dsv4_fp8_kv_packed_row_bytes_cpu(head_dim, n_rot);
+        uint8_t *packed = xmalloc((size_t)row_bytes);
+        uint8_t *packed2 = xmalloc((size_t)row_bytes);
+
+        for (int trial = 0; trial < 32; trial++) {
+            for (uint32_t i = 0; i < head_dim; i++) {
+                rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+                const uint32_t bits = (uint32_t)(rng >> 33);
+                /* Values spanning several magnitudes, including near-zero
+                 * rows, since amax has a 1e-4 floor in both the reference
+                 * and the packer. */
+                const float scale = (trial % 4 == 0) ? 1.0e-5f : (trial % 4 == 1) ? 1.0f : (trial % 4 == 2) ? 64.0f : 4096.0f;
+                row[i] = (((float)bits / (float)UINT32_MAX) * 2.0f - 1.0f) * scale;
+            }
+            /* Reference: dsv4_fp8_kv_quantize_row_inplace_cpu() only touches
+             * the non-RoPE prefix (see ds4.c) and leaves the RoPE tail
+             * untouched, so it is the exact bit-for-bit oracle for the
+             * non-RoPE part of the packed format. */
+            memcpy(expected, row, (size_t)head_dim * sizeof(float));
+            dsv4_fp8_kv_quantize_row_inplace_cpu(expected, head_dim, n_rot);
+
+            dsv4_fp8_kv_pack_row_cpu(row, head_dim, n_rot, packed);
+            dsv4_fp8_kv_unpack_row_cpu(packed, head_dim, n_rot, got);
+
+            for (uint32_t i = 0; i < n_nope; i++) {
+                TEST_ASSERT(got[i] == expected[i]);
+            }
+            for (uint32_t i = n_nope; i < head_dim; i++) {
+                /* RoPE tail is intentionally kept at F16 (not F32) in the
+                 * packed format, so verify it stays close to the original
+                 * value and that a second pack/unpack pass is idempotent,
+                 * rather than requiring bit-for-bit F32 equality. */
+                const float diff = fabsf(got[i] - row[i]);
+                const float tol = fabsf(row[i]) * 0.02f + 1.0e-6f;
+                TEST_ASSERT(diff <= tol);
+            }
+
+            dsv4_fp8_kv_pack_row_cpu(got, head_dim, n_rot, packed2);
+            dsv4_fp8_kv_unpack_row_cpu(packed2, head_dim, n_rot, got2);
+            for (uint32_t i = 0; i < head_dim; i++) {
+                TEST_ASSERT(got2[i] == got[i]);
+            }
+        }
+
+        free(packed2);
+        free(packed);
+        free(got2);
+        free(got);
+        free(expected);
+        free(row);
+    }
+
+    /* The packed layout must always be smaller than the F32 layout it
+     * replaces once there is at least one 64-wide block to compress. */
+    TEST_ASSERT(dsv4_fp8_kv_packed_row_bytes_cpu(512u, 64u) < (uint64_t)512u * sizeof(float));
+}
+
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include <math.h>
@@ -2204,6 +2288,7 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
+    {"--fp8-kv-pack", "fp8-kv-pack", "ROCm packed FP8 compressed-KV cache pack/unpack matches the FP8 round-trip reference", test_fp8_kv_pack_roundtrip},
 };
 
 static void test_print_help(const char *prog) {

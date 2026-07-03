@@ -413,6 +413,47 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
+/* =========================================================================
+ * ROCm packed FP8 compressed-KV cache (opt-in, --kv-cache-fp8 / DS4_KV_CACHE_FP8=1).
+ * =========================================================================
+ *
+ * These pack/unpack the same E4M3-round-tripped compressed KV rows that
+ * ds4_gpu_dsv4_fp8_kv_quantize_tensor() produces into a compact byte layout
+ * (E4M3 codes + one power-of-two block-scale exponent per 64 elements + an
+ * F16 RoPE tail), so the persistent cache can be kept resident at roughly
+ * 1/3.5 the bytes of the F32 round-tripped representation.  Only the ROCm
+ * backend implements these, so the prototypes are gated on DS4_ROCM_BUILD;
+ * ds4.c supplies never-called static stubs elsewhere so shared call sites
+ * still compile and link (even at -O0) on Metal/CUDA/CPU builds.
+ */
+#ifdef DS4_ROCM_BUILD
+
+/* Bytes needed to store one packed row for the given head_dim/n_rot. */
+uint64_t ds4_gpu_kv_fp8_packed_row_bytes(uint32_t head_dim, uint32_t n_rot);
+
+/* Packs n_rows already-FP8-round-tripped F32 rows from rows_f32 (row-major,
+ * head_dim floats per row) into packed_cache at dst_row_offset_bytes. */
+int ds4_gpu_kv_fp8_pack_tensor(
+        ds4_gpu_tensor       *packed_cache,
+        uint64_t                dst_row_offset_bytes,
+        const ds4_gpu_tensor *rows_f32,
+        uint32_t                n_rows,
+        uint32_t                head_dim,
+        uint32_t                n_rot);
+
+/* Expands n_rows packed rows starting at src_row_offset_bytes in
+ * packed_cache back to F32 (row-major, head_dim floats per row) in out_f32.
+ * Reproduces the exact FP8 round-trip values. */
+int ds4_gpu_kv_fp8_unpack_tensor(
+        ds4_gpu_tensor       *out_f32,
+        const ds4_gpu_tensor *packed_cache,
+        uint64_t                src_row_offset_bytes,
+        uint32_t                n_rows,
+        uint32_t                head_dim,
+        uint32_t                n_rot);
+
+#endif /* DS4_ROCM_BUILD */
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
