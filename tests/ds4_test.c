@@ -11,6 +11,70 @@ void dsv4_fp8_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_t 
 uint64_t dsv4_fp8_kv_packed_row_bytes_cpu(uint32_t head_dim, uint32_t n_rot);
 void dsv4_fp8_kv_pack_row_cpu(const float *x, uint32_t head_dim, uint32_t n_rot, uint8_t *row_out);
 void dsv4_fp8_kv_unpack_row_cpu(const uint8_t *row_in, uint32_t head_dim, uint32_t n_rot, float *x_out);
+uint64_t dsv4_q8_kv_packed_row_bytes_cpu(uint32_t head_dim, uint32_t n_rot);
+void dsv4_q8_kv_pack_row_cpu(const float *x, uint32_t head_dim, uint32_t n_rot, uint8_t *row_out);
+void dsv4_q8_kv_unpack_row_cpu(const uint8_t *row_in, uint32_t head_dim, uint32_t n_rot, float *x_out);
+
+static void test_q8_kv_pack_roundtrip(void) {
+    static const uint32_t head_dims[] = {512u, 128u, 64u};
+    static const uint32_t n_rots[] = {64u, 0u, 64u};
+    uint64_t rng = 0x243f6a8885a308d3ull;
+
+    for (size_t shape = 0; shape < sizeof(head_dims) / sizeof(head_dims[0]); shape++) {
+        const uint32_t head_dim = head_dims[shape];
+        const uint32_t n_rot = n_rots[shape];
+        const uint32_t n_nope = head_dim - n_rot;
+        float *row = xmalloc((size_t)head_dim * sizeof(float));
+        float *got = xmalloc((size_t)head_dim * sizeof(float));
+        float *got2 = xmalloc((size_t)head_dim * sizeof(float));
+        const uint64_t row_bytes = dsv4_q8_kv_packed_row_bytes_cpu(head_dim, n_rot);
+        uint8_t *packed = xmalloc((size_t)row_bytes);
+        uint8_t *packed2 = xmalloc((size_t)row_bytes);
+
+        for (int trial = 0; trial < 32; trial++) {
+            for (uint32_t i = 0; i < head_dim; i++) {
+                rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+                const uint32_t bits = (uint32_t)(rng >> 33);
+                const float scale = (trial % 4 == 0) ? 1.0e-5f : (trial % 4 == 1) ? 1.0f : (trial % 4 == 2) ? 64.0f : 4096.0f;
+                row[i] = (((float)bits / (float)UINT32_MAX) * 2.0f - 1.0f) * scale;
+            }
+
+            dsv4_q8_kv_pack_row_cpu(row, head_dim, n_rot, packed);
+            dsv4_q8_kv_unpack_row_cpu(packed, head_dim, n_rot, got);
+
+            for (uint32_t off = 0; off < n_nope; off += 64u) {
+                float amax = 0.0f;
+                for (uint32_t i = 0; i < 64u && off + i < n_nope; i++) {
+                    const float av = fabsf(row[off + i]);
+                    if (av > amax) amax = av;
+                }
+                const float tol = amax > 0.0f ? amax / 127.0f * 0.51f + 1.0e-6f : 1.0e-6f;
+                for (uint32_t i = 0; i < 64u && off + i < n_nope; i++) {
+                    TEST_ASSERT(fabsf(got[off + i] - row[off + i]) <= tol);
+                }
+            }
+            for (uint32_t i = n_nope; i < head_dim; i++) {
+                const float diff = fabsf(got[i] - row[i]);
+                const float tol = fabsf(row[i]) * 0.02f + 1.0e-6f;
+                TEST_ASSERT(diff <= tol);
+            }
+
+            dsv4_q8_kv_pack_row_cpu(got, head_dim, n_rot, packed2);
+            dsv4_q8_kv_unpack_row_cpu(packed2, head_dim, n_rot, got2);
+            for (uint32_t i = 0; i < head_dim; i++) {
+                TEST_ASSERT(fabsf(got2[i] - got[i]) <= fabsf(got[i]) * 1.0e-6f + 1.0e-8f);
+            }
+        }
+
+        free(packed2);
+        free(packed);
+        free(got2);
+        free(got);
+        free(row);
+    }
+
+    TEST_ASSERT(dsv4_q8_kv_packed_row_bytes_cpu(512u, 64u) < (uint64_t)512u * sizeof(float));
+}
 
 static void test_fp8_kv_pack_roundtrip(void) {
     /* Matches the shape ds4.c actually uses (DS4_N_HEAD_DIM=512,
@@ -2289,6 +2353,7 @@ static const ds4_test_entry test_entries[] = {
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--fp8-kv-pack", "fp8-kv-pack", "ROCm packed FP8 compressed-KV cache pack/unpack matches the FP8 round-trip reference", test_fp8_kv_pack_roundtrip},
+    {"--q8-kv-pack", "q8-kv-pack", "ROCm packed Q8 compressed-KV cache pack/unpack stays within Q8 error bounds", test_q8_kv_pack_roundtrip},
 };
 
 static void test_print_help(const char *prog) {

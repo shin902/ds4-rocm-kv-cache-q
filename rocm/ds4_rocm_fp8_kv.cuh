@@ -137,6 +137,68 @@ __global__ static void fp8_kv_unpack_rot_kernel(
     rows_f32[(uint64_t)row * head_dim + n_nope + i] = f16_bits_to_f32(rot[i]);
 }
 
+/* =========================================================================
+ * ROCm packed Q8 compressed-KV cache (opt-in, --kv-cache-q8).
+ * =========================================================================
+ *
+ * Conventional symmetric int8 storage for the non-RoPE prefix: one signed Q8
+ * byte per value, one F32 amax/127 scale per 64-wide block, and the RoPE tail
+ * kept at F16.  This mirrors dsv4_q8_kv_pack_row_cpu()/unpack_row_cpu().
+ */
+
+__device__ static int8_t q8_kv_quantize_code_dev(float v, float scale) {
+    if (scale <= 0.0f) return 0;
+    float qf = v / scale;
+    qf = fminf(127.0f, fmaxf(-127.0f, qf));
+    int q = qf >= 0.0f ? (int)floorf(qf + 0.5f) : (int)ceilf(qf - 0.5f);
+    if (q > 127) q = 127;
+    if (q < -127) q = -127;
+    return (int8_t)q;
+}
+
+__global__ static void q8_kv_pack_nonrope_kernel(
+        uint8_t *packed, uint64_t row_bytes, uint32_t codes_off, uint32_t scale_off,
+        const float *rows_f32, uint32_t head_dim, uint32_t n_nope, uint32_t n_rows) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t grp = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t off = grp * 64u;
+    if (row >= n_rows || off >= n_nope) return;
+    const float *xr = rows_f32 + (uint64_t)row * head_dim;
+    uint8_t *out = packed + (uint64_t)row * row_bytes;
+    __shared__ float scratch[64];
+    float v = 0.0f;
+    if (tid < 64u && off + tid < n_nope) v = xr[off + tid];
+    scratch[tid] = (tid < 64u && off + tid < n_nope) ? fabsf(v) : 0.0f;
+    __syncthreads();
+    for (uint32_t stride = 32; stride > 0; stride >>= 1) {
+        if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+        __syncthreads();
+    }
+    const float scale = scratch[0] > 0.0f ? scratch[0] / 127.0f : 1.0e-8f;
+    if (tid == 0) ((float *)(void *)(out + scale_off))[grp] = scale;
+    if (tid < 64u && off + tid < n_nope) {
+        ((int8_t *)(void *)(out + codes_off))[off + tid] = q8_kv_quantize_code_dev(v, scale);
+    }
+}
+
+__global__ static void q8_kv_unpack_nonrope_kernel(
+        float *rows_f32, uint32_t head_dim,
+        const uint8_t *packed, uint64_t row_bytes, uint32_t codes_off, uint32_t scale_off,
+        uint32_t n_nope, uint32_t n_rows) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t grp = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t off = grp * 64u;
+    if (row >= n_rows || off >= n_nope) return;
+    const uint8_t *in = packed + (uint64_t)row * row_bytes;
+    if (tid < 64u && off + tid < n_nope) {
+        const float scale = ((const float *)(const void *)(in + scale_off))[grp];
+        const int8_t code = ((const int8_t *)(const void *)(in + codes_off))[off + tid];
+        rows_f32[(uint64_t)row * head_dim + off + tid] = (float)code * scale;
+    }
+}
+
 __global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * head_dim;

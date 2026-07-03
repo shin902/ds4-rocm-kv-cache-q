@@ -2629,6 +2629,95 @@ void dsv4_fp8_kv_unpack_row_cpu(const uint8_t *row_in, uint32_t head_dim, uint32
     }
 }
 
+/* =========================================================================
+ * ROCm packed Q8 compressed-KV cache format.
+ * =========================================================================
+ *
+ * Experimental sibling of the FP8 packed cache: each non-RoPE block stores
+ * 64 signed int8 values plus one F32 symmetric scale (amax / 127), while the
+ * RoPE tail remains F16.  This is mostly useful as a conventional integer
+ * quantization reference/diagnostic; memory use is close to FP8 because both
+ * formats spend one byte per non-RoPE element plus small block metadata.
+ */
+
+#define DSV4_Q8_KV_BLOCK 64u
+
+static uint32_t dsv4_q8_kv_pack_n_blocks(uint32_t n_nope) {
+    return (n_nope + DSV4_Q8_KV_BLOCK - 1u) / DSV4_Q8_KV_BLOCK;
+}
+
+static uint32_t dsv4_q8_kv_pack_scale_off(uint32_t n_nope) {
+    return (n_nope + 3u) & ~3u; /* keep F32 scales naturally aligned */
+}
+
+static uint32_t dsv4_q8_kv_pack_rot_off(uint32_t n_nope, uint32_t n_blocks) {
+    const uint32_t off = dsv4_q8_kv_pack_scale_off(n_nope) + n_blocks * (uint32_t)sizeof(float);
+    return off + (off & 1u); /* pad to a 2-byte boundary for the F16 tail */
+}
+
+uint64_t dsv4_q8_kv_packed_row_bytes_cpu(uint32_t head_dim, uint32_t n_rot) {
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t n_blocks = dsv4_q8_kv_pack_n_blocks(n_nope);
+    const uint32_t rot_off = dsv4_q8_kv_pack_rot_off(n_nope, n_blocks);
+    const uint64_t bytes = (uint64_t)rot_off + (uint64_t)n_rot * sizeof(uint16_t);
+    return (bytes + 3u) & ~3ull; /* keep the next row's F32 scales aligned */
+}
+
+static int8_t dsv4_q8_kv_quantize_code_cpu(float v, float scale) {
+    if (scale <= 0.0f) return 0;
+    float qf = v / scale;
+    if (qf > 127.0f) qf = 127.0f;
+    if (qf < -127.0f) qf = -127.0f;
+    const int q = qf >= 0.0f ? (int)floorf(qf + 0.5f) : (int)ceilf(qf - 0.5f);
+    return (int8_t)q;
+}
+
+void dsv4_q8_kv_pack_row_cpu(const float *x, uint32_t head_dim, uint32_t n_rot, uint8_t *row_out) {
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t n_blocks = dsv4_q8_kv_pack_n_blocks(n_nope);
+    int8_t *codes = (int8_t *)(void *)row_out;
+    uint8_t *scale_base = row_out + dsv4_q8_kv_pack_scale_off(n_nope);
+    uint16_t *rot = (uint16_t *)(void *)(row_out + dsv4_q8_kv_pack_rot_off(n_nope, n_blocks));
+
+    for (uint32_t off = 0; off < n_nope; off += DSV4_Q8_KV_BLOCK) {
+        float amax = 0.0f;
+        for (uint32_t i = 0; i < DSV4_Q8_KV_BLOCK && off + i < n_nope; i++) {
+            const float av = fabsf(x[off + i]);
+            if (av > amax) amax = av;
+        }
+        const float scale = amax > 0.0f ? amax / 127.0f : 1.0e-8f;
+        memcpy(scale_base + (uint64_t)(off / DSV4_Q8_KV_BLOCK) * sizeof(float), &scale, sizeof(float));
+        for (uint32_t i = 0; i < DSV4_Q8_KV_BLOCK && off + i < n_nope; i++) {
+            codes[off + i] = dsv4_q8_kv_quantize_code_cpu(x[off + i], scale);
+        }
+    }
+    for (uint32_t i = 0; i < n_rot; i++) {
+        const uint16_t h = f32_to_f16(x[n_nope + i]);
+        memcpy(&rot[i], &h, sizeof(uint16_t));
+    }
+}
+
+void dsv4_q8_kv_unpack_row_cpu(const uint8_t *row_in, uint32_t head_dim, uint32_t n_rot, float *x_out) {
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t n_blocks = dsv4_q8_kv_pack_n_blocks(n_nope);
+    const int8_t *codes = (const int8_t *)(const void *)row_in;
+    const uint8_t *scale_base = row_in + dsv4_q8_kv_pack_scale_off(n_nope);
+    const uint16_t *rot = (const uint16_t *)(const void *)(row_in + dsv4_q8_kv_pack_rot_off(n_nope, n_blocks));
+
+    for (uint32_t off = 0; off < n_nope; off += DSV4_Q8_KV_BLOCK) {
+        float scale;
+        memcpy(&scale, scale_base + (uint64_t)(off / DSV4_Q8_KV_BLOCK) * sizeof(float), sizeof(float));
+        for (uint32_t i = 0; i < DSV4_Q8_KV_BLOCK && off + i < n_nope; i++) {
+            x_out[off + i] = (float)codes[off + i] * scale;
+        }
+    }
+    for (uint32_t i = 0; i < n_rot; i++) {
+        uint16_t h;
+        memcpy(&h, &rot[i], sizeof(uint16_t));
+        x_out[n_nope + i] = f16_to_f32(h);
+    }
+}
+
 static float dsv4_e2m1fn_value_cpu(int i) {
     static const float values[8] = {
         0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
@@ -10422,32 +10511,56 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
 #endif
 
 /*
- * ROCm (Strix Halo) opt-in: pack the same compressed KV cache rows as FP8
- * E4M3 bytes plus one power-of-two block scale per 64 elements, keeping only
- * the RoPE tail at F16.  See the "ROCm packed FP8 compressed-KV cache format"
- * block comment above dsv4_fp8_kv_pack_row_cpu() for the exact byte layout.
- * Off by default; toggle with --kv-cache-fp8 or DS4_KV_CACHE_FP8=1.  This is
- * deliberately compiled out on Apple/CUDA: Metal already has its own F16
- * storage path above, and CUDA has not been asked for this optimization.
+ * ROCm (Strix Halo) opt-ins: pack compressed KV cache rows into a low-byte
+ * storage format while keeping the RoPE tail at F16.  FP8 stores E4M3 bytes
+ * plus one power-of-two scale exponent per 64 values; Q8 stores signed int8
+ * values plus one F32 symmetric scale per 64 values.  Off by default; toggle
+ * with --kv-cache-fp8 / DS4_KV_CACHE_FP8=1 or --kv-cache-q8 /
+ * DS4_KV_CACHE_Q8=1.  These are deliberately compiled out on Apple/CUDA.
  */
-static bool ds4_kv_cache_fp8_enabled(void) {
+typedef enum {
+    DS4_KV_CACHE_PACK_NONE = 0,
+    DS4_KV_CACHE_PACK_FP8  = 1,
+    DS4_KV_CACHE_PACK_Q8   = 2,
+} ds4_kv_cache_pack_mode;
+
+static DS4_MAYBE_UNUSED bool ds4_env_truthy(const char *name) {
+    const char *env = getenv(name);
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
+static ds4_kv_cache_pack_mode ds4_kv_cache_pack_mode_current(void) {
 #if defined(DS4_ROCM_BUILD)
     static int cached = -1;
     if (cached < 0) {
-        const char *env = getenv("DS4_KV_CACHE_FP8");
-        cached = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+        /* If both are set, prefer the explicitly requested integer format. */
+        cached = ds4_env_truthy("DS4_KV_CACHE_Q8") ? DS4_KV_CACHE_PACK_Q8 :
+                 ds4_env_truthy("DS4_KV_CACHE_FP8") ? DS4_KV_CACHE_PACK_FP8 :
+                 DS4_KV_CACHE_PACK_NONE;
     }
-    return cached != 0;
+    return (ds4_kv_cache_pack_mode)cached;
 #else
-    return false;
+    return DS4_KV_CACHE_PACK_NONE;
 #endif
+}
+
+static bool ds4_kv_cache_fp8_enabled(void) {
+    return ds4_kv_cache_pack_mode_current() == DS4_KV_CACHE_PACK_FP8;
+}
+
+static bool ds4_kv_cache_q8_enabled(void) {
+    return ds4_kv_cache_pack_mode_current() == DS4_KV_CACHE_PACK_Q8;
+}
+
+static bool ds4_kv_cache_packed_enabled(void) {
+    return ds4_kv_cache_pack_mode_current() != DS4_KV_CACHE_PACK_NONE;
 }
 
 #if !defined(DS4_ROCM_BUILD)
 /* Never-called stubs for the ROCm-only packed-cache entry points declared in
- * ds4_gpu.h: ds4_kv_cache_fp8_enabled() is constant false here, but the call
- * sites below still need these to compile and link on Metal/CUDA/CPU builds
- * (a -O0 build would otherwise keep the dead calls and fail to link). */
+ * ds4_gpu.h: ds4_kv_cache_packed_enabled() is constant false here, but the
+ * call sites below still need these to compile and link on Metal/CUDA/CPU
+ * builds (a -O0 build would otherwise keep the dead calls and fail to link). */
 static DS4_MAYBE_UNUSED uint64_t ds4_gpu_kv_fp8_packed_row_bytes(uint32_t head_dim, uint32_t n_rot) {
     (void)head_dim; (void)n_rot;
     return 0;
@@ -10464,6 +10577,32 @@ static DS4_MAYBE_UNUSED int ds4_gpu_kv_fp8_pack_tensor(
     return 0;
 }
 static DS4_MAYBE_UNUSED int ds4_gpu_kv_fp8_unpack_tensor(
+        ds4_gpu_tensor       *out_f32,
+        const ds4_gpu_tensor *packed_cache,
+        uint64_t                src_row_offset_bytes,
+        uint32_t                n_rows,
+        uint32_t                head_dim,
+        uint32_t                n_rot) {
+    (void)out_f32; (void)packed_cache; (void)src_row_offset_bytes;
+    (void)n_rows; (void)head_dim; (void)n_rot;
+    return 0;
+}
+static DS4_MAYBE_UNUSED uint64_t ds4_gpu_kv_q8_packed_row_bytes(uint32_t head_dim, uint32_t n_rot) {
+    (void)head_dim; (void)n_rot;
+    return 0;
+}
+static DS4_MAYBE_UNUSED int ds4_gpu_kv_q8_pack_tensor(
+        ds4_gpu_tensor       *packed_cache,
+        uint64_t                dst_row_offset_bytes,
+        const ds4_gpu_tensor *rows_f32,
+        uint32_t                n_rows,
+        uint32_t                head_dim,
+        uint32_t                n_rot) {
+    (void)packed_cache; (void)dst_row_offset_bytes; (void)rows_f32;
+    (void)n_rows; (void)head_dim; (void)n_rot;
+    return 0;
+}
+static DS4_MAYBE_UNUSED int ds4_gpu_kv_q8_unpack_tensor(
         ds4_gpu_tensor       *out_f32,
         const ds4_gpu_tensor *packed_cache,
         uint64_t                src_row_offset_bytes,
@@ -10989,8 +11128,8 @@ static uint64_t metal_graph_context_bytes_for_kv_policy(
         uint64_t attn_stage_cap = (uint64_t)(prefill_cap / min_ratio + 2u);
         if (attn_stage_cap < 2u) attn_stage_cap = 2u;
         bytes += attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
-        if (ds4_kv_cache_fp8_enabled()) {
-            /* Shared read-side F32 expansion buffer (attn_comp_fp8_scratch),
+        if (ds4_kv_cache_packed_enabled()) {
+            /* Shared read-side F32 expansion buffer for packed FP8/Q8 caches,
              * sized to comp_cap rows and allocated once regardless of layer
              * count. */
             bytes += comp_cap * DS4_N_HEAD_DIM * sizeof(float);
@@ -11179,7 +11318,7 @@ static bool metal_graph_alloc_raw_cap(
     if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
     g->comp_cap = ctx_size / min_ratio + 2u;
     if (g->comp_cap < 2u) g->comp_cap = 2u;
-    if (DS4_GPU_ATTN_COMP_CACHE_F16 || ds4_kv_cache_fp8_enabled()) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 || ds4_kv_cache_packed_enabled()) {
         g->attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
         if (g->attn_comp_stage_cap < 2u) g->attn_comp_stage_cap = 2u;
     }
@@ -11305,11 +11444,11 @@ static bool metal_graph_alloc_raw_cap(
     }
     g->comp_kv_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
     g->comp_sc_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
-    if (DS4_GPU_ATTN_COMP_CACHE_F16 || ds4_kv_cache_fp8_enabled()) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 || ds4_kv_cache_packed_enabled()) {
         g->attn_comp_stage = ds4_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
                                                   DS4_N_HEAD_DIM * sizeof(float));
     }
-    if (ds4_kv_cache_fp8_enabled()) {
+    if (ds4_kv_cache_packed_enabled()) {
         /* Shared read-side expansion buffer: one layer's compressed-KV cache
          * unpacked to F32 at a time.  Sized to the worst-case per-layer
          * capacity so every compressed layer can reuse it in turn. */
@@ -11448,8 +11587,8 @@ static bool metal_graph_alloc_raw_cap(
                     g->attn_cur && g->attn_norm && g->qr && g->qr_norm &&
                     g->q && g->kv_raw && g->kv &&
                     g->comp_kv_cur && g->comp_sc_cur &&
-                    (!(DS4_GPU_ATTN_COMP_CACHE_F16 || ds4_kv_cache_fp8_enabled()) || g->attn_comp_stage) &&
-                    (!ds4_kv_cache_fp8_enabled() || g->attn_comp_fp8_scratch) &&
+                    (!(DS4_GPU_ATTN_COMP_CACHE_F16 || ds4_kv_cache_packed_enabled()) || g->attn_comp_stage) &&
+                    (!ds4_kv_cache_packed_enabled() || g->attn_comp_fp8_scratch) &&
                     g->indexer_q && g->indexer_weights && g->indexer_scores &&
                     g->comp_mask && g->comp_selected &&
                     g->heads && g->attn_low && g->attn_out &&
@@ -13681,6 +13820,9 @@ static bool metal_graph_decode_kv_store(
 }
 
 static uint64_t metal_graph_attn_comp_cache_row_bytes(void) {
+    if (ds4_kv_cache_q8_enabled()) {
+        return ds4_gpu_kv_q8_packed_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT);
+    }
     if (ds4_kv_cache_fp8_enabled()) {
         return ds4_gpu_kv_fp8_packed_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT);
     }
@@ -13694,9 +13836,9 @@ static uint32_t metal_graph_attn_comp_cache_is_f16(void) {
 
 /* True when the persistent compressed-KV cache needs an F32 staging buffer
  * around writes/reads instead of being touched directly: Metal's F16 cache
- * and ROCm's packed-FP8 cache both need this, plain F32 storage does not. */
+ * and ROCm's packed FP8/Q8 caches need this, plain F32 storage does not. */
 static bool metal_graph_attn_comp_cache_needs_stage(void) {
-    return DS4_GPU_ATTN_COMP_CACHE_F16 || ds4_kv_cache_fp8_enabled();
+    return DS4_GPU_ATTN_COMP_CACHE_F16 || ds4_kv_cache_packed_enabled();
 }
 
 static bool metal_graph_store_attn_comp_stage(
@@ -13715,6 +13857,14 @@ static bool metal_graph_store_attn_comp_stage(
     const uint64_t count = (uint64_t)rows * DS4_N_HEAD_DIM;
     const uint64_t dst_offset = (uint64_t)first_row *
                                 metal_graph_attn_comp_cache_row_bytes();
+    if (ds4_kv_cache_q8_enabled()) {
+        return ds4_gpu_kv_q8_pack_tensor(g->layer_attn_comp_cache[il],
+                                         dst_offset,
+                                         g->attn_comp_stage,
+                                         rows,
+                                         DS4_N_HEAD_DIM,
+                                         DS4_N_ROT) != 0;
+    }
     if (ds4_kv_cache_fp8_enabled()) {
         return ds4_gpu_kv_fp8_pack_tensor(g->layer_attn_comp_cache[il],
                                           dst_offset,
@@ -13789,31 +13939,37 @@ static void metal_graph_attn_comp_prefill_target_free(ds4_gpu_tensor *t) {
     if (!metal_graph_attn_comp_cache_needs_stage()) ds4_gpu_tensor_free(t);
 }
 
-/* Read-side counterpart of the stage helpers above: ROCm packed-FP8 mode
- * keeps every already-committed row for a layer packed in
+/* Read-side counterpart of the stage helpers above: ROCm packed FP8/Q8 modes
+ * keep every already-committed row for a layer packed in
  * g->layer_attn_comp_cache[il], but none of the ROCm attention/indexer
- * kernels understand that byte layout.  Before those kernels run, expand the
+ * kernels understand those byte layouts.  Before those kernels run, expand the
  * currently visible n_comp rows into the shared g->attn_comp_fp8_scratch F32
  * buffer and hand that to the kernel instead -- the kernel sees ordinary F32
  * rows either way, indexable exactly like the un-packed cache, including
  * under the indexer's gathered top-k row selection.  A no-op (returns the
- * raw cache tensor unchanged) unless --kv-cache-fp8 is enabled. */
+ * raw cache tensor unchanged) unless a packed KV-cache mode is enabled. */
 static ds4_gpu_tensor *metal_graph_attn_comp_read_view(
         ds4_gpu_graph *g,
         uint32_t       il,
         uint32_t       n_comp) {
-    if (!ds4_kv_cache_fp8_enabled()) return g->layer_attn_comp_cache[il];
+    if (!ds4_kv_cache_packed_enabled()) return g->layer_attn_comp_cache[il];
     if (!g || il >= DS4_N_LAYER || !g->layer_attn_comp_cache[il] || !g->attn_comp_fp8_scratch) return NULL;
     if (n_comp == 0) return g->layer_attn_comp_cache[il];
     if (n_comp > g->comp_cap) return NULL;
-    if (!ds4_gpu_kv_fp8_unpack_tensor(g->attn_comp_fp8_scratch,
+    const int ok = ds4_kv_cache_q8_enabled()
+        ? ds4_gpu_kv_q8_unpack_tensor(g->attn_comp_fp8_scratch,
                                       g->layer_attn_comp_cache[il],
                                       0,
                                       n_comp,
                                       DS4_N_HEAD_DIM,
-                                      DS4_N_ROT)) {
-        return NULL;
-    }
+                                      DS4_N_ROT)
+        : ds4_gpu_kv_fp8_unpack_tensor(g->attn_comp_fp8_scratch,
+                                       g->layer_attn_comp_cache[il],
+                                       0,
+                                       n_comp,
+                                       DS4_N_HEAD_DIM,
+                                       DS4_N_ROT);
+    if (!ok) return NULL;
     return g->attn_comp_fp8_scratch;
 }
 
@@ -21845,7 +22001,20 @@ static int metal_graph_prompt_logits_test(
                 const uint64_t n = (uint64_t)n_comp * DS4_N_HEAD_DIM;
                 float *gpu_comp = xmalloc((size_t)n * sizeof(float));
                 bool comp_read = false;
-                if (ds4_kv_cache_fp8_enabled()) {
+                if (ds4_kv_cache_q8_enabled()) {
+                    const uint64_t row_bytes = ds4_gpu_kv_q8_packed_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT);
+                    uint8_t *gpu_comp_packed = xmalloc((size_t)((uint64_t)n_comp * row_bytes));
+                    if (ds4_gpu_tensor_read(g.layer_attn_comp_cache[il], 0,
+                                            gpu_comp_packed, (uint64_t)n_comp * row_bytes) != 0) {
+                        for (uint32_t r = 0; r < n_comp; r++) {
+                            dsv4_q8_kv_unpack_row_cpu(gpu_comp_packed + (uint64_t)r * row_bytes,
+                                                      DS4_N_HEAD_DIM, DS4_N_ROT,
+                                                      gpu_comp + (uint64_t)r * DS4_N_HEAD_DIM);
+                        }
+                        comp_read = true;
+                    }
+                    free(gpu_comp_packed);
+                } else if (ds4_kv_cache_fp8_enabled()) {
                     const uint64_t row_bytes = ds4_gpu_kv_fp8_packed_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT);
                     uint8_t *gpu_comp_packed = xmalloc((size_t)((uint64_t)n_comp * row_bytes));
                     if (ds4_gpu_tensor_read(g.layer_attn_comp_cache[il], 0,
@@ -23837,12 +24006,11 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gp
     return 0;
 }
 
-/* ROCm --kv-cache-fp8 counterparts of the F16 helpers above.  Packed rows
- * are variable-layout (E4M3 codes + scale bytes + F16 tail), so these chunk
- * by whole rows instead of flat element counts, and reuse the CPU reference
- * pack/unpack from the "ROCm packed FP8 compressed-KV cache format" section
- * so on-disk checkpoints stay the stable per-element F32 format regardless
- * of whether the live cache was packed. */
+/* ROCm --kv-cache-fp8/--kv-cache-q8 counterparts of the F16 helpers above.
+ * Packed rows are variable-layout, so these chunk by whole rows instead of
+ * flat element counts and reuse the CPU reference pack/unpack helpers so
+ * on-disk checkpoints stay the stable per-element F32 format regardless of
+ * whether the live cache was packed. */
 static DS4_MAYBE_UNUSED int payload_write_tensor_span_fp8_packed_as_f32(
         FILE *fp, const ds4_gpu_tensor *tensor,
         uint64_t row_offset_rows, uint64_t n_rows,
@@ -23918,6 +24086,88 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_fp8_packed(
         if (ds4_gpu_tensor_write(tensor, (row_offset_rows + done) * row_bytes,
                                  packed_buf, (uint64_t)n * row_bytes) == 0) {
             payload_set_err(err, errlen, "failed to restore ROCm packed FP8 session tensor");
+            return 1;
+        }
+        done += n;
+    }
+    return 0;
+}
+
+static DS4_MAYBE_UNUSED int payload_write_tensor_span_q8_packed_as_f32(
+        FILE *fp, const ds4_gpu_tensor *tensor,
+        uint64_t row_offset_rows, uint64_t n_rows,
+        uint32_t head_dim, uint32_t n_rot,
+        uint8_t *buf, size_t cap, char *err, size_t errlen) {
+    const uint64_t row_bytes = ds4_gpu_kv_q8_packed_row_bytes(head_dim, n_rot);
+    if (!tensor || row_bytes == 0 ||
+        row_offset_rows > ds4_gpu_tensor_bytes(tensor) / row_bytes ||
+        n_rows > ds4_gpu_tensor_bytes(tensor) / row_bytes - row_offset_rows) {
+        payload_set_err(err, errlen, "session tensor is smaller than the Q8 packed payload");
+        return 1;
+    }
+
+    const size_t rows_per_chunk = cap / (size_t)(row_bytes + (uint64_t)head_dim * sizeof(float));
+    if (rows_per_chunk == 0) {
+        payload_set_err(err, errlen, "session tensor conversion buffer is too small");
+        return 1;
+    }
+    uint8_t *packed_buf = buf;
+    float *f = (float *)(void *)(buf + rows_per_chunk * row_bytes);
+
+    uint64_t done = 0;
+    while (done < n_rows) {
+        const size_t n = n_rows - done > (uint64_t)rows_per_chunk
+            ? rows_per_chunk
+            : (size_t)(n_rows - done);
+        if (ds4_gpu_tensor_read(tensor, (row_offset_rows + done) * row_bytes,
+                                packed_buf, (uint64_t)n * row_bytes) == 0) {
+            payload_set_err(err, errlen, "failed to read ROCm packed Q8 session tensor");
+            return 1;
+        }
+        for (size_t r = 0; r < n; r++) {
+            dsv4_q8_kv_unpack_row_cpu(packed_buf + (uint64_t)r * row_bytes, head_dim, n_rot,
+                                      f + (uint64_t)r * head_dim);
+        }
+        if (payload_write_bytes(fp, f, (uint64_t)n * head_dim * sizeof(float), err, errlen) != 0) return 1;
+        done += n;
+    }
+    return 0;
+}
+
+static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_q8_packed(
+        FILE *fp, ds4_gpu_tensor *tensor,
+        uint64_t row_offset_rows, uint64_t n_rows,
+        uint32_t head_dim, uint32_t n_rot,
+        uint8_t *buf, size_t cap, uint64_t *remaining, char *err, size_t errlen) {
+    const uint64_t row_bytes = ds4_gpu_kv_q8_packed_row_bytes(head_dim, n_rot);
+    if (!tensor || row_bytes == 0 ||
+        row_offset_rows > ds4_gpu_tensor_bytes(tensor) / row_bytes ||
+        n_rows > ds4_gpu_tensor_bytes(tensor) / row_bytes - row_offset_rows) {
+        payload_set_err(err, errlen, "session tensor is smaller than the Q8 packed payload");
+        return 1;
+    }
+
+    const size_t rows_per_chunk = cap / (size_t)(row_bytes + (uint64_t)head_dim * sizeof(float));
+    if (rows_per_chunk == 0) {
+        payload_set_err(err, errlen, "session tensor conversion buffer is too small");
+        return 1;
+    }
+    uint8_t *packed_buf = buf;
+    float *f = (float *)(void *)(buf + rows_per_chunk * row_bytes);
+
+    uint64_t done = 0;
+    while (done < n_rows) {
+        const size_t n = n_rows - done > (uint64_t)rows_per_chunk
+            ? rows_per_chunk
+            : (size_t)(n_rows - done);
+        if (payload_read_bytes(fp, f, (uint64_t)n * head_dim * sizeof(float), remaining, err, errlen) != 0) return 1;
+        for (size_t r = 0; r < n; r++) {
+            dsv4_q8_kv_pack_row_cpu(f + (uint64_t)r * head_dim, head_dim, n_rot,
+                                    packed_buf + (uint64_t)r * row_bytes);
+        }
+        if (ds4_gpu_tensor_write(tensor, (row_offset_rows + done) * row_bytes,
+                                 packed_buf, (uint64_t)n * row_bytes) == 0) {
+            payload_set_err(err, errlen, "failed to restore ROCm packed Q8 session tensor");
             return 1;
         }
         done += n;
@@ -24081,7 +24331,18 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (ds4_kv_cache_fp8_enabled()) {
+        if (ds4_kv_cache_q8_enabled()) {
+            rc = payload_write_tensor_span_q8_packed_as_f32(fp,
+                                                            g->layer_attn_comp_cache[il],
+                                                            0,
+                                                            (uint64_t)g->layer_n_comp[il],
+                                                            DS4_N_HEAD_DIM,
+                                                            DS4_N_ROT,
+                                                            buf,
+                                                            DS4_SESSION_IO_CHUNK,
+                                                            err,
+                                                            errlen);
+        } else if (ds4_kv_cache_fp8_enabled()) {
             rc = payload_write_tensor_span_fp8_packed_as_f32(fp,
                                                              g->layer_attn_comp_cache[il],
                                                              0,
@@ -24293,7 +24554,19 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (ds4_kv_cache_fp8_enabled()) {
+        if (ds4_kv_cache_q8_enabled()) {
+            rc = payload_read_tensor_span_f32_as_q8_packed(fp,
+                                                           g->layer_attn_comp_cache[il],
+                                                           0,
+                                                           (uint64_t)n_comp[i],
+                                                           DS4_N_HEAD_DIM,
+                                                           DS4_N_ROT,
+                                                           buf,
+                                                           DS4_SESSION_IO_CHUNK,
+                                                           &remaining,
+                                                           err,
+                                                           errlen);
+        } else if (ds4_kv_cache_fp8_enabled()) {
             rc = payload_read_tensor_span_f32_as_fp8_packed(fp,
                                                             g->layer_attn_comp_cache[il],
                                                             0,
@@ -24788,7 +25061,18 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         /* Compressed rows are append-only from row zero, so the live prefix is
          * contiguous.  The two compressor state tensors hold the partial window
          * that will become the next compressed row. */
-        if (ds4_kv_cache_fp8_enabled()) {
+        if (ds4_kv_cache_q8_enabled()) {
+            rc = payload_write_tensor_span_q8_packed_as_f32(fp,
+                                                            g->layer_attn_comp_cache[il],
+                                                            0,
+                                                            (uint64_t)g->layer_n_comp[il],
+                                                            DS4_N_HEAD_DIM,
+                                                            DS4_N_ROT,
+                                                            buf,
+                                                            DS4_SESSION_IO_CHUNK,
+                                                            err,
+                                                            errlen);
+        } else if (ds4_kv_cache_fp8_enabled()) {
             rc = payload_write_tensor_span_fp8_packed_as_f32(fp,
                                                              g->layer_attn_comp_cache[il],
                                                              0,
@@ -25135,7 +25419,19 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (ds4_kv_cache_fp8_enabled()) {
+        if (ds4_kv_cache_q8_enabled()) {
+            rc = payload_read_tensor_span_f32_as_q8_packed(fp,
+                                                           g->layer_attn_comp_cache[il],
+                                                           0,
+                                                           (uint64_t)n_comp[il],
+                                                           DS4_N_HEAD_DIM,
+                                                           DS4_N_ROT,
+                                                           buf,
+                                                           DS4_SESSION_IO_CHUNK,
+                                                           &remaining,
+                                                           err,
+                                                           errlen);
+        } else if (ds4_kv_cache_fp8_enabled()) {
             rc = payload_read_tensor_span_f32_as_fp8_packed(fp,
                                                             g->layer_attn_comp_cache[il],
                                                             0,
