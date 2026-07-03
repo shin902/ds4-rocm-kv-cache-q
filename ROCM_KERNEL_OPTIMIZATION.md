@@ -1,189 +1,365 @@
-# ROCm GPU kernel optimization notes
+# Strix Halo / ROCm 向け GPU カーネル最適化メモ
 
-This note summarizes the current Strix Halo / ROCm performance picture for DS4, especially the difference between KV-cache packing and model-weight Q8 kernels.
-
-## Terminology
-
-There are two unrelated "caches" in the logs:
-
-### KV cache
-
-Transformer runtime state:
-
-- Stores previous-token key/value rows.
-- Avoids recomputing past tokens during decode.
-- `--kv-cache-fp8` and `--kv-cache-q8` reduce the resident size of the **compressed KV cache**.
-- This helps fit larger contexts / larger prefill chunks, but it does not reduce the model weights read per decoded token.
-
-### Q8 FP16 weight cache
-
-ROCm weight acceleration path:
-
-- Some Q8 model tensors can be dequantized once into FP16 buffers.
-- Later matmuls can use hipBLAS/hipBLASLt-style FP16 paths.
-- If this cache cannot be allocated, DS4 falls back to direct Q8 kernels:
+対象はこの構成に絞る。
 
 ```text
-ds4: ROCm q8 fp16 cache budget exhausted; using q8 kernels
+GPU/UMA: Strix Halo / AMD Radeon 8060S Graphics
+メモリ: 約94 GiB usable
+モデル: DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+目的: このモデルを長いコンテキストで動かす
 ```
 
-This is not the KV cache. It means the model-weight fast path has no extra memory budget.
+## 現状ログの意味
 
-## Current observed state
-
-Example log:
+例:
 
 ```text
 ds4: ROCm preparing model tensor mappings: 80.24 GiB
 ds4: ROCm q8 fp16 cache budget exhausted; using q8 kernels (request=4.00 MiB cached=0.00 GiB free=0.99 GiB reserve=4.70 GiB total=94.00 GiB)
-ds4: context buffers 23.90 MiB (ctx=163, backend=rocm, prefill_chunk=163, raw_kv_rows=256, compressed_kv_rows=42)
-ds4: prefill: 22.38 t/s, generation: 16.35 t/s
+ds4: context buffers 859.93 MiB (ctx=60000, backend=rocm, prefill_chunk=256, raw_kv_rows=512, compressed_kv_rows=15002)
 ```
 
-Interpretation:
+この状態では、モデル本体はメモリに乗っている。KV cache も機能している。
 
-- The model fits in memory.
-- The KV cache exists and functions normally.
-- The Q8 FP16 weight cache has **0 GiB** allocated.
-- Even the first 4 MiB cache request is rejected because free memory is below the safety reserve:
+問題は、Q8 重みを FP16 に展開して置く高速化用バッファが 0 GiB であること。
 
 ```text
-cache budget = free - reserve = 0.99 GiB - 4.70 GiB < 0
+cached=0.00 GiB
 ```
 
-So inference uses the direct Q8 weight kernels.
+ただし、この構成で長い context を優先するなら、これはある程度受け入れるしかない。モデル本体が約80 GiBあり、94 GiB UMA上で長い KV/context buffer も持つため、FP16 展開済み weight cache に回す余裕はほぼない。
 
-## Decode bandwidth estimate
-
-For DeepSeek V4 Flash shape:
-
-- Layers: 43
-- Embedding: 4096
-- Active experts: 6
-- FF expert dim: 2048
-- Main Q8 tensors include attention projections, shared experts, and output head.
-- Routed experts are active-subset only, not all experts every token.
-
-Approximate active model-weight traffic per decoded token:
+つまり方針は:
 
 ```text
-IQ2XXS active routed experts: ~5.6 GB/token
-Q2_K active routed experts:  ~6.0 GB/token
+FP16 weight cache で速くする
 ```
 
-At observed decode speed:
+ではなく、
 
 ```text
-16.35 tok/s * 5.6..6.0 GB/token = ~91..99 GB/s
+Q8/IQ2/Q2 の直読み kernel のまま、長い context を成立させる
 ```
 
-Against a nominal 256 GB/s memory bandwidth:
+になる。
+
+## 今回の `--kv-cache-q8` の位置づけ
+
+`--kv-cache-q8` は decode の重み読みを減らす機能ではない。
+
+目的は:
 
 ```text
-~36..39% of peak
+compressed KV cache の常駐量を減らす
+→ ctx を長くする
+→ prefill_chunk を少しでも確保する
+→ OOM を避ける
 ```
 
-At 20 tok/s:
+この目的には合っている。
+
+単独で decode TPS が大きく上がることは期待しない。
+
+## decode の帯域見積もり
+
+このモデルは MoE なので、毎 token で 80 GiB 全部を読むわけではない。active expert の分だけ読む。
+
+Flash 形状と active experts=6 から概算すると、decode 1 token あたりの主な重み読みはおおよそ:
 
 ```text
-20 tok/s * 5.6..6.0 GB/token = ~112..120 GB/s
-=> ~44..47% of 256 GB/s
+5.6〜6.0 GB / token
 ```
 
-This is a lower-bound estimate based mainly on model-weight reads. Real traffic also includes scales, activations, intermediate writes, non-coalesced access, and dispatch overhead.
-
-## Why decode may not improve much
-
-Decode is mostly one token at a time:
-
-- Low arithmetic reuse per weight read.
-- Large amount of model weight traffic per token.
-- Direct Q8 kernels must load quantized bytes and scales, then dequantize in-kernel.
-- If memory bandwidth is the bottleneck, kernel tuning can improve efficiency but may not change the fundamental TPS ceiling dramatically.
-
-In contrast, prefill can process multiple tokens at once. Larger prefill chunks improve reuse and make GEMM-like kernels more efficient, but they require more memory.
-
-## Current Q8 direct path
-
-The direct path is already active when the log says:
+観測値:
 
 ```text
-using q8 kernels
+generation: 16.35 t/s
 ```
 
-Relevant files:
+なら:
 
-- `rocm/ds4_rocm_matmul.cuh`
-- `rocm/ds4_rocm_attention_launch.cuh`
-- `rocm/ds4_rocm_norm_rope.cuh`
-- `rocm/ds4_rocm_runtime.cuh`
+```text
+16.35 * 5.6〜6.0 GB = 約91〜99 GB/s
+```
 
-The FP16 weight-cache selection is around:
+Strix Halo の理論帯域を 256 GB/s とすると:
 
-- `cuda_q8_f16_ptr(...)`
-- `cuda_q8_f16_transpose_ptr(...)`
-- `cuda_q8_f16_cache_has_budget(...)`
+```text
+約36〜39%
+```
 
-## Optimization directions
+20 t/s なら:
 
-### 1. Make direct Q8 kernels more bandwidth-efficient
+```text
+20 * 5.6〜6.0 GB = 約112〜120 GB/s
+理論比 約44〜47%
+```
 
-Possible kernel-level work:
+この数字は、重み本体の読みだけを見た下限。実際には scale、activation、temporary、非連続アクセス、kernel launch、dequant 計算もある。
 
-- Better tiling for small-batch decode.
-- Coalesced/vectorized loads for Q8 blocks and scales.
-- Reduce redundant scale loads.
-- Fuse dequantization with dot accumulation more tightly.
-- Use LDS/shared memory where reuse exists.
-- Specialize hot shapes instead of one generic path.
-- Reduce launch count for tiny decode operations.
+したがって decode はすでにメモリ帯域寄りで、GPU kernel を少し触っても大幅には伸びない可能性が高い。
 
-Expected impact:
+## 優先順位
 
-- Potentially useful, but bounded if decode is already bandwidth-limited.
+このモデルと長 context を前提にすると、優先順位は以下。
 
-### 2. Improve prefill kernels
+### 1. 長 context を落とさない
 
-Prefill has more room for GPU occupancy and reuse:
+最優先。
 
-- Token batch dimension > 1.
-- Weight reuse across tokens.
-- More GEMM-like workload.
+```text
+--ctx 60000 以上を成立させる
+OOM killer を避ける
+server の KV checkpoint も成立させる
+```
 
-Possible work:
+そのため、KV cache の Q8/FP8 packing は有効。
 
-- Q8 direct batched matmul tiling.
-- Better chunk-size-specific kernels.
-- Fuse adjacent projection/norm/activation steps where safe.
+### 2. prefill をできるだけ落とさない
 
-Expected impact:
+長い prompt / checkpoint rebuild / server 利用では prefill が重要。
 
-- More promising than decode if memory allows chunk sizes above very small values.
+ただしメモリが厳しいため、prefill_chunk は大きくできない。
 
-### 3. Free memory to enable some Q8 FP16 weight cache
+```text
+ctx=60000 で prefill_chunk=256 程度
+```
 
-This is not kernel tuning, but may have a large effect:
+のような条件で、Q8/IQ2/Q2 直読み kernel がどれだけ効率よく動くかが重要。
 
-- Reduce context size.
-- Use `--kv-cache-q8` / `--kv-cache-fp8` to reduce KV pressure.
-- Use SSD streaming to lower resident model pressure, then allocate selected hot FP16 caches.
-- Lower the reserve only if OOM risk is acceptable.
+### 3. decode は大幅改善を期待しすぎない
 
-Expected impact:
+decode は 1 token ずつで、重み再利用が少ない。
 
-- If even a subset of hot Q8 tensors can be cached as FP16, selected matmuls may switch to faster library paths.
+このモデルをこのメモリ量で動かす限り、decode は:
 
-### 4. Reduce decoded-token weight traffic
+```text
+Q8/IQ2/Q2 重みを毎 token 読む
+```
 
-If decode is memory-bandwidth bound, the strongest levers reduce bytes/token:
+構造から逃げにくい。
 
-- More aggressive weight quantization for hot tensors.
-- Smaller model / fewer active experts.
-- Speculative decoding / MTP to amortize decode overhead.
-- Multi-request batching, if serving multiple requests.
+## GPU カーネル最適化の対象
 
-## Practical conclusion
+この方針で触るべきファイルは主に以下。
 
-`--kv-cache-q8` is primarily a memory-capacity feature. It can help fit larger contexts or larger prefill chunks, but it should not be expected to greatly improve single-stream decode TPS.
+```text
+rocm/ds4_rocm_matmul.cuh
+rocm/ds4_rocm_attention_launch.cuh
+rocm/ds4_rocm_norm_rope.cuh
+rocm/ds4_rocm_runtime.cuh
+```
 
-For decode, current performance is likely constrained by direct Q8 model-weight reads and available memory bandwidth. Kernel work can improve utilization, but large gains may require reducing bytes/token or enabling some FP16 weight cache.
+特に見る対象:
+
+```text
+Q8_0 direct matmul
+Q8_0 batched matmul
+attention output A/B
+attn_q_a / attn_q_b
+shared expert Q8
+output Q8
+routed expert IQ2XXS / Q2_K path
+```
+
+## 変更方針
+
+### 方針A: decode ではなく prefill 小chunk向けに寄せる
+
+この構成では decode の大幅改善は難しい可能性が高い。
+
+一方で prefill は token batch があるため、chunk=256 程度でも decode よりは再利用余地がある。
+
+狙うなら:
+
+```text
+prefill_chunk=128〜512
+```
+
+の範囲で効く kernel。
+
+大きな batch 向け GEMM だけを速くしても、この環境では使えない可能性がある。
+
+### 方針B: FP16 weight cache 前提の高速化は捨てる
+
+このモデル + 長 context では、FP16 weight cache 用の空きがほぼない。
+
+したがって:
+
+```text
+cuda_q8_f16_ptr()
+cuda_q8_f16_transpose_ptr()
+```
+
+に乗る前提の最適化は優先度が低い。
+
+必要なのは:
+
+```text
+cache が 0 GiB でも速い direct path
+```
+
+### 方針C: kernel launch 数を減らす
+
+chunk が小さいと、launch overhead や stage 分割の影響が大きい。
+
+可能なら:
+
+```text
+norm + matmul
+matmul + activation
+Q8 dequant + dot
+attention output の小さい projection 群
+```
+
+などをまとめる余地を見る。
+
+ただし可読性と検証コストは上がる。
+
+### 方針D: Q8 だけでなく IQ2XXS/Q2_K も見る
+
+モデル名から、Q8 だけを速くしても全体改善は限定される可能性がある。
+
+```text
+IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8
+```
+
+なので、active expert 側の IQ2XXS / Q2_K 読みも decode/prefill の支配要因になる。
+
+Q8 kernel だけを最適化する場合は、まず Q8 部分が実際にどれだけ時間を食っているか測る必要がある。
+
+## やるなら最初に入れるべき計測
+
+kernel を触る前に、ROCm path に以下の粒度の時間ログを入れる。
+
+```text
+layerごと
+stageごと
+Q8 matmulごと
+expert matmulごと
+attention outputごと
+prefill/decode別
+```
+
+欲しい出力例:
+
+```text
+layer 12 decode attn_q_a_q8: 0.12 ms
+layer 12 decode attn_q_b_q8: 0.31 ms
+layer 12 decode attn_output_a_q8: 0.08 ms
+layer 12 decode attn_output_b_q8: 0.22 ms
+layer 12 decode routed_iq2: 1.40 ms
+layer 12 decode shared_q8: 0.35 ms
+```
+
+これがないと、Q8 を触るべきか、IQ2/Q2 expert を触るべきか、attention output を触るべきか判断できない。
+
+## 具体的な実装候補
+
+### 1. 小chunk prefill 用 Q8 batched matmul
+
+対象:
+
+```text
+rocm/ds4_rocm_matmul.cuh
+```
+
+狙い:
+
+```text
+n_tok = 128〜512
+in_dim/out_dim は DS4 固定形状
+Q8_0 weight direct read
+```
+
+やること:
+
+```text
+shape 固定の specialized kernel
+weight block と scale の coalesced load
+activation tile の再利用
+出力 tile の連続 write
+```
+
+期待:
+
+```text
+prefill 改善の可能性あり
+decode には大きく効かない
+```
+
+### 2. attention output A/B の direct Q8 path 改善
+
+対象:
+
+```text
+rocm/ds4_rocm_attention_launch.cuh
+```
+
+このモデルでは `AProjQ8` / `OutQ8` が重い。
+
+FP16 transpose cache が作れない前提で、Q8 direct のまま output projection を速くする。
+
+期待:
+
+```text
+prefill と decode の両方に少し効く可能性
+ただし decode は帯域上限で伸びにくい
+```
+
+### 3. routed expert IQ2XXS/Q2_K path の計測と最適化
+
+対象:
+
+```text
+rocm/ds4_rocm_matmul.cuh
+expert系kernel
+```
+
+このモデルでは active expert 6個を毎 token 読む。
+
+decode ではここが支配的な可能性がある。
+
+期待:
+
+```text
+decode に効く可能性はQ8単体より高いかもしれない
+ただし実装難度は高い
+```
+
+### 4. Q8 FP16 cache reserve を削るのは最後
+
+ログ上:
+
+```text
+free=0.99 GiB
+reserve=4.70 GiB
+```
+
+reserve を削れば一部 cache は作れるかもしれない。
+
+しかし長 context 目的では OOM risk が高い。
+
+今回の主目的が:
+
+```text
+このモデルを長 context で安定動作させる
+```
+
+なので、reserve 削減は最後の手段。
+
+## 現時点の結論
+
+このモデル・Strix Halo・長 context 前提では、最適化方針は以下。
+
+```text
+1. KV cache Q8/FP8 packing は維持する
+2. FP16 weight cache に頼らない
+3. decode の大幅改善は期待しすぎない
+4. prefill 小chunk向け direct Q8/IQ2/Q2 kernel を見る
+5. まず stage別/kernel別の計測を入れる
+```
+
+`--kv-cache-q8` は速度チューニングではなく、長 context を成立させるためのメモリチューニングとして扱う。
+
+GPU kernel 最適化を続けるなら、最初の作業は実装変更ではなく、ROCm decode/prefill の stage 別 profiling ログを入れること。
