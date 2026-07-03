@@ -6,7 +6,8 @@
 GPU/UMA: Strix Halo / AMD Radeon 8060S Graphics
 メモリ: 約94 GiB usable
 モデル: DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
-目的: このモデルを長いコンテキストで動かす
+目的: このモデルを長いコンテキストで動かしつつ、prefill を伸ばす
+非目的: decode TPS の大幅改善を主目的にしない
 ```
 
 ## 現状ログの意味
@@ -141,6 +142,10 @@ Q8/IQ2/Q2 重みを毎 token 読む
 
 ## GPU カーネル最適化の対象
 
+ここで知りたいことは、`--kv-cache-q8` のような保存形式の追加ではなく、prefill を速くするためにどの低レイヤー実装を触るか、という話。
+
+結論として、prefill を伸ばす本命は GPU kernel 側の変更になる。
+
 この方針で触るべきファイルは主に以下。
 
 ```text
@@ -161,6 +166,82 @@ shared expert Q8
 output Q8
 routed expert IQ2XXS / Q2_K path
 ```
+
+## 速くするには何を変えるか
+
+### GPU kernel 側で変えること
+
+prefill を速くするには、主に ROCm/HIP kernel の中身を触る。
+
+具体的には以下。
+
+```text
+thread/block の割り当て変更
+tiling
+LDS/shared memory 利用
+vectorized load
+Q8 block/scale の読み方改善
+int8 dot 命令や packed 演算の利用可能性確認
+scale 適用の最適化
+activation tile の再利用
+複数 token batch 対応
+小さい prefill_chunk=128〜512 向けの specialized kernel
+```
+
+このモデル・長 context 前提では、大きな batch GEMM だけを速くしても足りない。メモリ制約で `prefill_chunk=256` 付近まで落とすことがあるため、小chunk prefill で効く kernel が必要。
+
+特に見るべきなのは:
+
+```text
+Q8_0 batched matmul
+attention output A/B の Q8 direct path
+attn_q_a / attn_q_b の Q8 direct path
+shared expert Q8 path
+routed expert IQ2XXS / Q2_K path
+```
+
+### C/C++ 側だけで変えられること
+
+C/C++ 側だけでも多少の改善余地はある。
+
+例:
+
+```text
+どの kernel を呼ぶかの切り替え
+prefill chunk size の選択
+cache 方針
+staging buffer の使い方
+dispatch 回数削減
+隣接 stage のまとめ方
+profiling ログ追加
+```
+
+ただし、根本が:
+
+```text
+Q8/IQ2/Q2 direct path の prefill が遅い
+```
+
+であるなら、C 側だけでは限界がある。最終的には ROCm/HIP kernel の中で、読み方・並列化・tile 化を変える必要がある。
+
+### 今回やらない方向
+
+以下は優先度が低い。
+
+```text
+FP16 weight cache 前提の高速化
+decode 1 token path だけを狙った最適化
+大chunk専用 GEMM 最適化
+```
+
+理由は、今回の目的が:
+
+```text
+このモデルを長 context で動かす
+その条件で prefill を伸ばす
+```
+
+だから。
 
 ## 変更方針
 
@@ -244,15 +325,15 @@ prefill/decode別
 欲しい出力例:
 
 ```text
-layer 12 decode attn_q_a_q8: 0.12 ms
-layer 12 decode attn_q_b_q8: 0.31 ms
-layer 12 decode attn_output_a_q8: 0.08 ms
-layer 12 decode attn_output_b_q8: 0.22 ms
-layer 12 decode routed_iq2: 1.40 ms
-layer 12 decode shared_q8: 0.35 ms
+layer 12 prefill n_tok=256 attn_q_a_q8: 0.80 ms
+layer 12 prefill n_tok=256 attn_q_b_q8: 1.70 ms
+layer 12 prefill n_tok=256 attn_output_a_q8: 0.55 ms
+layer 12 prefill n_tok=256 attn_output_b_q8: 1.20 ms
+layer 12 prefill n_tok=256 routed_iq2: 4.80 ms
+layer 12 prefill n_tok=256 shared_q8: 1.40 ms
 ```
 
-これがないと、Q8 を触るべきか、IQ2/Q2 expert を触るべきか、attention output を触るべきか判断できない。
+これがないと、prefill で Q8 を触るべきか、IQ2/Q2 expert を触るべきか、attention output を触るべきか判断できない。
 
 ## 具体的な実装候補
 
@@ -318,12 +399,13 @@ expert系kernel
 
 このモデルでは active expert 6個を毎 token 読む。
 
-decode ではここが支配的な可能性がある。
+長い prompt の prefill では expert 側もまとまった token batch で走るため、ここが重い可能性がある。
 
 期待:
 
 ```text
-decode に効く可能性はQ8単体より高いかもしれない
+prefill に効く可能性がある
+Q8単体より優先度が高い可能性もある
 ただし実装難度は高い
 ```
 
@@ -362,4 +444,6 @@ reserve を削れば一部 cache は作れるかもしれない。
 
 `--kv-cache-q8` は速度チューニングではなく、長 context を成立させるためのメモリチューニングとして扱う。
 
-GPU kernel 最適化を続けるなら、最初の作業は実装変更ではなく、ROCm decode/prefill の stage 別 profiling ログを入れること。
+GPU kernel 最適化を続けるなら、最初の作業は実装変更ではなく、ROCm prefill の stage 別 profiling ログを入れること。
+
+その計測結果を見て、`rocm/ds4_rocm_matmul.cuh` の Q8 batched matmul から触るのか、`rocm/ds4_rocm_attention_launch.cuh` の attention output を触るのか、expert 側 IQ2/Q2 kernel を触るのか決める。
