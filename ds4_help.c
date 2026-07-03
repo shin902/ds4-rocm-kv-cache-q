@@ -147,8 +147,13 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
                                 ds4_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
     opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
+#ifdef DS4_ROCM_BUILD
+    opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");
+    opt(fp, c, "--backend NAME", "Backend name: metal, rocm, or cpu.");
+#else
     opt(fp, c, "--metal | --cuda | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: metal, cuda, or cpu.");
+#endif
     if (tool != DS4_HELP_BENCH) {
         opt(fp, c, "-c, --ctx N", "Allocated context tokens.");
     }
@@ -157,6 +162,16 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     }
     opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
     opt(fp, c, "--power N", "GPU duty-cycle target, 1..100. Default: 100");
+    opt(fp, c, "--ssd-streaming", "Metal/CUDA/ROCm: opt in to SSD-backed model streaming instead of full residency.");
+    opt(fp, c, "--ssd-streaming-cold", "SSD streaming: skip default popularity-based expert-cache preload.");
+    opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming: routed expert cache as expert count or GiB, e.g. 32GB. Metal/ROCm default: 80% working set minus non-routed weights; CUDA default: backend fixed cache.");
+    opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. Default: auto hot seed capped at 4096; use --ssd-streaming-cold to skip.");
+#ifdef DS4_ROCM_BUILD
+    opt(fp, c, "--kv-cache-fp8", "ROCm only: keep the compressed KV cache packed as FP8 bytes + block scales instead of F32, cutting its resident size by roughly 2/3. Same as DS4_KV_CACHE_FP8=1. Default: off.");
+    opt(fp, c, "--kv-cache-q8", "ROCm only: keep the compressed KV cache packed as signed Q8 bytes + F32 block scales instead of F32. Same as DS4_KV_CACHE_Q8=1. Default: off; wins over FP8 if both are set.");
+#endif
+    opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
+    opt(fp, c, "--prefill-chunk N", "Metal graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
     if (full) {
         if (tool != DS4_HELP_BENCH) {
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
@@ -167,6 +182,9 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
         opt(fp, c, "--warm-weights", "Touch mapped tensor pages at startup to reduce first-use stalls.");
+        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_BENCH) {
+            opt(fp, c, "--expert-profile FILE", "Metal-only: write routed expert locality/cache simulation JSON.");
+        }
     }
     fputc('\n', fp);
 }
@@ -234,6 +252,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--dump-logits FILE", "Write full next-token logits as JSON.");
     opt(fp, c, "--dump-logprobs FILE", "Write greedy continuation top-logprobs as JSON.");
     opt(fp, c, "--logprobs-top-k N", "Alternatives stored by --dump-logprobs. Default: 20");
+    opt(fp, c, "--expert-profile FILE", "Metal-only: write routed expert locality/cache simulation JSON.");
     opt(fp, c, "--perplexity-file FILE", "Score raw text with teacher-forced NLL.");
     opt(fp, c, "--imatrix-dataset FILE", "Rendered prompt dataset for imatrix collection.");
     opt(fp, c, "--imatrix-out FILE", "Write llama-compatible routed-MoE imatrix .dat.");
