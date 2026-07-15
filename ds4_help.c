@@ -169,6 +169,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
 #ifdef DS4_ROCM_BUILD
     opt(fp, c, "--kv-cache-fp8", "ROCm only: keep the compressed KV cache packed as FP8 bytes + block scales instead of F32, cutting its resident size by roughly 2/3. Same as DS4_KV_CACHE_FP8=1. Default: off.");
     opt(fp, c, "--kv-cache-q8", "ROCm only: keep the compressed KV cache packed as signed Q8 bytes + F32 block scales instead of F32. Same as DS4_KV_CACHE_Q8=1. Default: off; wins over FP8 if both are set.");
+    opt(fp, c, "--kv-cache-tq4", "ROCm experimental: direct-attention TurboQuant MSE cache with 4-bit Lloyd-Max codes. Same as DS4_KV_CACHE_TQ4=1.");
+    opt(fp, c, "--kv-cache-tq2", "ROCm experimental: direct-attention TurboQuant MSE cache with 2-bit Lloyd-Max codes. Same as DS4_KV_CACHE_TQ2=1; TQ4 wins if both are set.");
 #endif
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N", "Metal graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");

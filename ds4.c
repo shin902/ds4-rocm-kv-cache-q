@@ -2718,6 +2718,143 @@ void dsv4_q8_kv_unpack_row_cpu(const uint8_t *row_in, uint32_t head_dim, uint32_
     }
 }
 
+/* =========================================================================
+ * TurboQuant MSE packed compressed-KV cache reference.
+ * =========================================================================
+ *
+ * DS4 uses one 512-wide compressed-attention vector as both key and value.
+ * The product/QJL TurboQuant variant cannot reconstruct that shared value
+ * vector, so TQ4/TQ2 deliberately use Algorithm 1's MSE representation:
+ *
+ *   y = H D x / sqrt(d),  q_i = LloydMax(y_i / rms(x)).
+ *
+ * H is the Walsh-Hadamard matrix and D is a fixed data-oblivious sign
+ * diagonal.  The packed row is [codes][F16 rms][padding to four bytes].
+ * Queries receive the same forward rotation; attention outputs receive the
+ * inverse D H / sqrt(d) rotation before the existing inverse RoPE.  One
+ * per-row RMS is the only metadata and keeps the format independent of
+ * chunking or calibration data.
+ */
+
+#define DSV4_TQ_MAX_DIM 512u
+
+static const float dsv4_tq2_centroids[4] = {
+    -1.510417608f, -0.452780035f, 0.452780035f, 1.510417608f,
+};
+
+static const float dsv4_tq4_centroids[16] = {
+    -2.732589571f, -2.069017227f, -1.618046386f, -1.256231197f,
+    -0.942340456f, -0.656759119f, -0.388048299f, -0.128395030f,
+     0.128395030f,  0.388048299f,  0.656759119f,  0.942340456f,
+     1.256231197f,  1.618046386f,  2.069017227f,  2.732589571f,
+};
+
+static uint32_t dsv4_tq_sign_bit(uint32_t i) {
+    uint32_t x = i + 0x9e3779b9u;
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x >> 31;
+}
+
+static bool dsv4_tq_dim_supported(uint32_t n) {
+    return n != 0u && n <= DSV4_TQ_MAX_DIM && (n & (n - 1u)) == 0u;
+}
+
+/* In-place orthonormal RHT shared by the CPU oracle and ROCm kernels. */
+void dsv4_tq_transform_row_inplace_cpu(float *x, uint32_t n, bool inverse) {
+    if (!x || !dsv4_tq_dim_supported(n)) return;
+    if (!inverse) {
+        for (uint32_t i = 0; i < n; i++) {
+            if (dsv4_tq_sign_bit(i)) x[i] = -x[i];
+        }
+    }
+    for (uint32_t width = 1u; width < n; width <<= 1u) {
+        for (uint32_t base = 0; base < n; base += width << 1u) {
+            for (uint32_t j = 0; j < width; j++) {
+                const float a = x[base + j];
+                const float b = x[base + width + j];
+                x[base + j] = a + b;
+                x[base + width + j] = a - b;
+            }
+        }
+    }
+    const float scale = 1.0f / sqrtf((float)n);
+    for (uint32_t i = 0; i < n; i++) x[i] *= scale;
+    if (inverse) {
+        for (uint32_t i = 0; i < n; i++) {
+            if (dsv4_tq_sign_bit(i)) x[i] = -x[i];
+        }
+    }
+}
+
+static uint32_t dsv4_tq_codes_bytes(uint32_t head_dim, uint32_t bits) {
+    return (head_dim * bits + 7u) >> 3u;
+}
+
+uint64_t dsv4_tq_kv_packed_row_bytes_cpu(uint32_t head_dim, uint32_t bits) {
+    if (!dsv4_tq_dim_supported(head_dim) || (bits != 2u && bits != 4u)) return 0;
+    const uint64_t bytes = (uint64_t)dsv4_tq_codes_bytes(head_dim, bits) + sizeof(uint16_t);
+    return (bytes + 3u) & ~3ull;
+}
+
+static uint32_t dsv4_tq_quantize_code_cpu(float x, uint32_t bits) {
+    const float *centroids = bits == 4u ? dsv4_tq4_centroids : dsv4_tq2_centroids;
+    const uint32_t levels = 1u << bits;
+    uint32_t best = 0;
+    float best_diff = fabsf(x - centroids[0]);
+    for (uint32_t i = 1; i < levels; i++) {
+        const float diff = fabsf(x - centroids[i]);
+        if (diff < best_diff) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    return best;
+}
+
+void dsv4_tq_kv_pack_row_cpu(const float *x, uint32_t head_dim, uint32_t bits, uint8_t *row_out) {
+    const uint64_t row_bytes = dsv4_tq_kv_packed_row_bytes_cpu(head_dim, bits);
+    if (!x || !row_out || row_bytes == 0) return;
+    float y[DSV4_TQ_MAX_DIM];
+    double ss = 0.0;
+    for (uint32_t i = 0; i < head_dim; i++) {
+        y[i] = x[i];
+        ss += (double)x[i] * x[i];
+    }
+    dsv4_tq_transform_row_inplace_cpu(y, head_dim, false);
+    const float rms = sqrtf((float)(ss / (double)head_dim));
+    const float inv_rms = rms > 0.0f ? 1.0f / rms : 0.0f;
+    const uint32_t code_bytes = dsv4_tq_codes_bytes(head_dim, bits);
+    memset(row_out, 0, (size_t)row_bytes);
+    for (uint32_t i = 0; i < head_dim; i++) {
+        const uint32_t code = dsv4_tq_quantize_code_cpu(y[i] * inv_rms, bits);
+        const uint32_t bit = i * bits;
+        row_out[bit >> 3u] |= (uint8_t)(code << (bit & 7u));
+    }
+    const uint16_t rms_f16 = f32_to_f16(rms);
+    memcpy(row_out + code_bytes, &rms_f16, sizeof(rms_f16));
+}
+
+void dsv4_tq_kv_unpack_row_cpu(const uint8_t *row_in, uint32_t head_dim, uint32_t bits, float *x_out) {
+    const uint64_t row_bytes = dsv4_tq_kv_packed_row_bytes_cpu(head_dim, bits);
+    if (!row_in || !x_out || row_bytes == 0) return;
+    const float *centroids = bits == 4u ? dsv4_tq4_centroids : dsv4_tq2_centroids;
+    const uint32_t mask = (1u << bits) - 1u;
+    const uint32_t code_bytes = dsv4_tq_codes_bytes(head_dim, bits);
+    uint16_t rms_f16;
+    memcpy(&rms_f16, row_in + code_bytes, sizeof(rms_f16));
+    const float rms = f16_to_f32(rms_f16);
+    for (uint32_t i = 0; i < head_dim; i++) {
+        const uint32_t bit = i * bits;
+        const uint32_t code = (row_in[bit >> 3u] >> (bit & 7u)) & mask;
+        x_out[i] = centroids[code] * rms;
+    }
+    dsv4_tq_transform_row_inplace_cpu(x_out, head_dim, true);
+}
+
 static float dsv4_e2m1fn_value_cpu(int i) {
     static const float values[8] = {
         0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
@@ -10511,17 +10648,18 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
 #endif
 
 /*
- * ROCm (Strix Halo) opt-ins: pack compressed KV cache rows into a low-byte
- * storage format while keeping the RoPE tail at F16.  FP8 stores E4M3 bytes
- * plus one power-of-two scale exponent per 64 values; Q8 stores signed int8
- * values plus one F32 symmetric scale per 64 values.  Off by default; toggle
- * with --kv-cache-fp8 / DS4_KV_CACHE_FP8=1 or --kv-cache-q8 /
- * DS4_KV_CACHE_Q8=1.  These are deliberately compiled out on Apple/CUDA.
+ * ROCm (Strix Halo) opt-ins for packed compressed KV rows.  FP8 stores E4M3
+ * bytes plus block scales and Q8 stores signed int8 values plus block scales.
+ * TQ4/TQ2 use a full-width randomized Hadamard transform, Lloyd-Max codes and
+ * one F16 RMS per row; their attention path reads the packed rows directly.
+ * All modes are off by default and deliberately compiled out on Apple/CUDA.
  */
 typedef enum {
     DS4_KV_CACHE_PACK_NONE = 0,
     DS4_KV_CACHE_PACK_FP8  = 1,
     DS4_KV_CACHE_PACK_Q8   = 2,
+    DS4_KV_CACHE_PACK_TQ4  = 3,
+    DS4_KV_CACHE_PACK_TQ2  = 4,
 } ds4_kv_cache_pack_mode;
 
 static DS4_MAYBE_UNUSED bool ds4_env_truthy(const char *name) {
@@ -10533,8 +10671,10 @@ static ds4_kv_cache_pack_mode ds4_kv_cache_pack_mode_current(void) {
 #if defined(DS4_ROCM_BUILD)
     static int cached = -1;
     if (cached < 0) {
-        /* If both are set, prefer the explicitly requested integer format. */
-        cached = ds4_env_truthy("DS4_KV_CACHE_Q8") ? DS4_KV_CACHE_PACK_Q8 :
+        /* TQ4 is the conservative choice if both experimental TQ modes are set. */
+        cached = ds4_env_truthy("DS4_KV_CACHE_TQ4") ? DS4_KV_CACHE_PACK_TQ4 :
+                 ds4_env_truthy("DS4_KV_CACHE_TQ2") ? DS4_KV_CACHE_PACK_TQ2 :
+                 ds4_env_truthy("DS4_KV_CACHE_Q8") ? DS4_KV_CACHE_PACK_Q8 :
                  ds4_env_truthy("DS4_KV_CACHE_FP8") ? DS4_KV_CACHE_PACK_FP8 :
                  DS4_KV_CACHE_PACK_NONE;
     }
@@ -10550,6 +10690,19 @@ static bool ds4_kv_cache_fp8_enabled(void) {
 
 static bool ds4_kv_cache_q8_enabled(void) {
     return ds4_kv_cache_pack_mode_current() == DS4_KV_CACHE_PACK_Q8;
+}
+
+static bool ds4_kv_cache_tq_enabled(void) {
+    const ds4_kv_cache_pack_mode mode = ds4_kv_cache_pack_mode_current();
+    return mode == DS4_KV_CACHE_PACK_TQ4 || mode == DS4_KV_CACHE_PACK_TQ2;
+}
+
+static uint32_t ds4_kv_cache_tq_bits(void) {
+    return ds4_kv_cache_pack_mode_current() == DS4_KV_CACHE_PACK_TQ2 ? 2u : 4u;
+}
+
+static bool ds4_kv_cache_expanded_read_scratch_needed(void) {
+    return ds4_kv_cache_fp8_enabled() || ds4_kv_cache_q8_enabled();
 }
 
 static bool ds4_kv_cache_packed_enabled(void) {
@@ -10611,6 +10764,31 @@ static DS4_MAYBE_UNUSED int ds4_gpu_kv_q8_unpack_tensor(
         uint32_t                n_rot) {
     (void)out_f32; (void)packed_cache; (void)src_row_offset_bytes;
     (void)n_rows; (void)head_dim; (void)n_rot;
+    return 0;
+}
+static DS4_MAYBE_UNUSED uint64_t ds4_gpu_kv_tq_packed_row_bytes(uint32_t head_dim, uint32_t bits) {
+    (void)head_dim; (void)bits;
+    return 0;
+}
+static DS4_MAYBE_UNUSED int ds4_gpu_kv_tq_pack_tensor(
+        ds4_gpu_tensor *packed_cache, uint64_t dst_row_offset_bytes,
+        const ds4_gpu_tensor *rows_f32, uint32_t n_rows,
+        uint32_t head_dim, uint32_t bits) {
+    (void)packed_cache; (void)dst_row_offset_bytes; (void)rows_f32;
+    (void)n_rows; (void)head_dim; (void)bits;
+    return 0;
+}
+static DS4_MAYBE_UNUSED int ds4_gpu_kv_tq_unpack_tensor(
+        ds4_gpu_tensor *out_f32, const ds4_gpu_tensor *packed_cache,
+        uint64_t src_row_offset_bytes, uint32_t n_rows,
+        uint32_t head_dim, uint32_t bits) {
+    (void)out_f32; (void)packed_cache; (void)src_row_offset_bytes;
+    (void)n_rows; (void)head_dim; (void)bits;
+    return 0;
+}
+static DS4_MAYBE_UNUSED int ds4_gpu_tq_transform_tensor(
+        ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim, bool inverse) {
+    (void)x; (void)n_rows; (void)head_dim; (void)inverse;
     return 0;
 }
 #endif /* !DS4_ROCM_BUILD */
@@ -11124,11 +11302,11 @@ static uint64_t metal_graph_context_bytes_for_kv_policy(
     if (kv_cache_bytes_out) *kv_cache_bytes_out = kv_cache_bytes;
     uint64_t bytes = kv_cache_bytes +
                      2ull * comp_cap * prefill_cap * sizeof(float);
-    if (metal_graph_attn_comp_cache_needs_stage()) {
+    if (metal_graph_attn_comp_cache_needs_stage() && !ds4_kv_cache_tq_enabled()) {
         uint64_t attn_stage_cap = (uint64_t)(prefill_cap / min_ratio + 2u);
         if (attn_stage_cap < 2u) attn_stage_cap = 2u;
         bytes += attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
-        if (ds4_kv_cache_packed_enabled()) {
+        if (ds4_kv_cache_expanded_read_scratch_needed()) {
             /* Shared read-side F32 expansion buffer for packed FP8/Q8 caches,
              * sized to comp_cap rows and allocated once regardless of layer
              * count. */
@@ -11444,11 +11622,12 @@ static bool metal_graph_alloc_raw_cap(
     }
     g->comp_kv_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
     g->comp_sc_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
-    if (DS4_GPU_ATTN_COMP_CACHE_F16 || ds4_kv_cache_packed_enabled()) {
+    if (DS4_GPU_ATTN_COMP_CACHE_F16 ||
+        (ds4_kv_cache_packed_enabled() && !ds4_kv_cache_tq_enabled())) {
         g->attn_comp_stage = ds4_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
                                                   DS4_N_HEAD_DIM * sizeof(float));
     }
-    if (ds4_kv_cache_packed_enabled()) {
+    if (ds4_kv_cache_expanded_read_scratch_needed()) {
         /* Shared read-side expansion buffer: one layer's compressed-KV cache
          * unpacked to F32 at a time.  Sized to the worst-case per-layer
          * capacity so every compressed layer can reuse it in turn. */
@@ -11529,6 +11708,15 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_indexer_q = ds4_gpu_tensor_alloc(pc * indexer_q_dim * sizeof(float));
     g->batch_indexer_weights = ds4_gpu_tensor_alloc(pc * DS4_N_INDEXER_HEAD * sizeof(float));
     g->batch_heads = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
+    /* TQ packing only needs emitted compressed rows until the immediately
+     * following pack launch.  Reuse the not-yet-written batch attention output
+     * instead of allocating another prefill-chunk-proportional F32 buffer. */
+    if (ds4_kv_cache_tq_enabled() && g->batch_heads) {
+        g->attn_comp_stage = ds4_gpu_tensor_view(
+                g->batch_heads,
+                0,
+                (uint64_t)g->attn_comp_stage_cap * DS4_N_HEAD_DIM * sizeof(float));
+    }
     g->batch_attn_low = ds4_gpu_tensor_alloc(pc * low_dim * sizeof(float));
     g->batch_attn_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
     g->batch_group_tmp = ds4_gpu_tensor_alloc(pc * group_dim * sizeof(float));
@@ -11588,7 +11776,7 @@ static bool metal_graph_alloc_raw_cap(
                     g->q && g->kv_raw && g->kv &&
                     g->comp_kv_cur && g->comp_sc_cur &&
                     (!(DS4_GPU_ATTN_COMP_CACHE_F16 || ds4_kv_cache_packed_enabled()) || g->attn_comp_stage) &&
-                    (!ds4_kv_cache_packed_enabled() || g->attn_comp_fp8_scratch) &&
+                    (!ds4_kv_cache_expanded_read_scratch_needed() || g->attn_comp_fp8_scratch) &&
                     g->indexer_q && g->indexer_weights && g->indexer_scores &&
                     g->comp_mask && g->comp_selected &&
                     g->heads && g->attn_low && g->attn_out &&
@@ -13805,7 +13993,12 @@ static bool metal_graph_decode_kv_store(
         ds4_gpu_tensor *kv,
         ds4_gpu_tensor *raw_cache,
         uint32_t          raw_cap,
-        uint32_t          raw_row) {
+        uint32_t          raw_row,
+        bool              tq_transform) {
+    if (tq_transform) {
+        return ds4_gpu_tq_transform_tensor(kv, 1, DS4_N_HEAD_DIM, false) != 0 &&
+               ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, DS4_N_HEAD_DIM) != 0;
+    }
     if (metal_graph_use_reference_kv_decode()) {
         return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0 &&
                ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, DS4_N_HEAD_DIM) != 0;
@@ -13820,6 +14013,9 @@ static bool metal_graph_decode_kv_store(
 }
 
 static uint64_t metal_graph_attn_comp_cache_row_bytes(void) {
+    if (ds4_kv_cache_tq_enabled()) {
+        return ds4_gpu_kv_tq_packed_row_bytes(DS4_N_HEAD_DIM, ds4_kv_cache_tq_bits());
+    }
     if (ds4_kv_cache_q8_enabled()) {
         return ds4_gpu_kv_q8_packed_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT);
     }
@@ -13830,7 +14026,12 @@ static uint64_t metal_graph_attn_comp_cache_row_bytes(void) {
            (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
 }
 
-static uint32_t metal_graph_attn_comp_cache_is_f16(void) {
+static uint32_t metal_graph_attn_comp_cache_format(void) {
+#if defined(DS4_ROCM_BUILD)
+    if (ds4_kv_cache_tq_enabled()) {
+        return ds4_kv_cache_tq_bits() == 2u ? DS4_GPU_COMP_KV_TQ2 : DS4_GPU_COMP_KV_TQ4;
+    }
+#endif
     return DS4_GPU_ATTN_COMP_CACHE_F16 ? 1u : 0u;
 }
 
@@ -13857,6 +14058,14 @@ static bool metal_graph_store_attn_comp_stage(
     const uint64_t count = (uint64_t)rows * DS4_N_HEAD_DIM;
     const uint64_t dst_offset = (uint64_t)first_row *
                                 metal_graph_attn_comp_cache_row_bytes();
+    if (ds4_kv_cache_tq_enabled()) {
+        return ds4_gpu_kv_tq_pack_tensor(g->layer_attn_comp_cache[il],
+                                         dst_offset,
+                                         g->attn_comp_stage,
+                                         rows,
+                                         DS4_N_HEAD_DIM,
+                                         ds4_kv_cache_tq_bits()) != 0;
+    }
     if (ds4_kv_cache_q8_enabled()) {
         return ds4_gpu_kv_q8_pack_tensor(g->layer_attn_comp_cache[il],
                                          dst_offset,
@@ -13952,7 +14161,9 @@ static ds4_gpu_tensor *metal_graph_attn_comp_read_view(
         ds4_gpu_graph *g,
         uint32_t       il,
         uint32_t       n_comp) {
-    if (!ds4_kv_cache_packed_enabled()) return g->layer_attn_comp_cache[il];
+    if (!ds4_kv_cache_packed_enabled() || ds4_kv_cache_tq_enabled()) {
+        return g->layer_attn_comp_cache[il];
+    }
     if (!g || il >= DS4_N_LAYER || !g->layer_attn_comp_cache[il] || !g->attn_comp_fp8_scratch) return NULL;
     if (n_comp == 0) return g->layer_attn_comp_cache[il];
     if (n_comp > g->comp_cap) return NULL;
@@ -15447,6 +15658,12 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("Qcur", g->q, q_dim, il, pos);
     }
+    if (ok && compressed && ds4_kv_cache_tq_enabled()) {
+        ok = ds4_gpu_tq_transform_tensor(g->q,
+                                          DS4_N_HEAD,
+                                          DS4_N_HEAD_DIM,
+                                          false) != 0;
+    }
     if (!qkv_rms_fused) {
         if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
                                                   layer->attn_kv->abs_offset,
@@ -15474,7 +15691,8 @@ static bool metal_graph_encode_decode_layer(
     /* RoPE stays as the exact standalone kernel above.  The decode fusion
      * starts after that, where FP8 KV quantization and raw-cache storage can
      * share one pass without changing the trigonometric path. */
-    if (ok) ok = metal_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row);
+    if (ok) ok = metal_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row,
+                                               compressed && ds4_kv_cache_tq_enabled());
     DS4_METAL_PROFILE_DECODE_STAGE("kv_path");
     if (ok) {
         metal_graph_debug_dump_tensor("KVcur", g->kv, DS4_N_HEAD_DIM, il, pos);
@@ -15557,7 +15775,8 @@ static bool metal_graph_encode_decode_layer(
             if (!comp_row_view) {
                 ok = false;
             } else {
-                ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+                ok = ds4_kv_cache_tq_enabled() ||
+                     ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
                 if (ok) {
                     metal_graph_debug_dump_tensor("KVcompress", comp_row_view, DS4_N_HEAD_DIM, il, pos);
                 }
@@ -15792,7 +16011,7 @@ static bool metal_graph_encode_decode_layer(
                     g->q,
                     raw_cache,
                     comp_cache,
-                    metal_graph_attn_comp_cache_is_f16(),
+                    metal_graph_attn_comp_cache_format(),
                     comp_selected,
                     1,
                     pos,
@@ -15821,7 +16040,7 @@ static bool metal_graph_encode_decode_layer(
                                                          raw_cap,
                                                          raw_start,
                                                          n_comp ? comp_cache : NULL,
-                                                         metal_graph_attn_comp_cache_is_f16(),
+                                                         metal_graph_attn_comp_cache_format(),
                                                          n_comp,
                                                          NULL,
                                                          0,
@@ -15831,6 +16050,12 @@ static bool metal_graph_encode_decode_layer(
     DS4_METAL_PROFILE_DECODE_STAGE("attention");
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_out", g->heads, q_dim, il, pos);
+    }
+    if (ok && compressed && ds4_kv_cache_tq_enabled()) {
+        ok = ds4_gpu_tq_transform_tensor(g->heads,
+                                          DS4_N_HEAD,
+                                          DS4_N_HEAD_DIM,
+                                          true) != 0;
     }
     if (ok) ok = ds4_gpu_rope_tail_tensor(g->heads,
                                             1, DS4_N_HEAD, DS4_N_HEAD_DIM,
@@ -17998,6 +18223,12 @@ static bool metal_graph_encode_layer_attention_batch(
         DS4_METAL_PROFILE_Q_STAGE("rope");
     }
     DS4_METAL_PROFILE_ATTN_STAGE("q_path");
+    if (ok && compressed && ds4_kv_cache_tq_enabled()) {
+        ok = ds4_gpu_tq_transform_tensor(g->batch_q,
+                                          n_tokens * DS4_N_HEAD,
+                                          DS4_N_HEAD_DIM,
+                                          false) != 0;
+    }
     if (!qkv_rms_fused) {
         if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_kv",
                                                           il,
@@ -18044,10 +18275,17 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_dump_tensor("KVrope", g->batch_kv,
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
     }
-    if (ok) ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(g->batch_kv,
-                                                       n_tokens,
-                                                       DS4_N_HEAD_DIM,
-                                                       DS4_N_ROT) != 0;
+    if (ok && compressed && ds4_kv_cache_tq_enabled()) {
+        ok = ds4_gpu_tq_transform_tensor(g->batch_kv,
+                                          n_tokens,
+                                          DS4_N_HEAD_DIM,
+                                          false) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(g->batch_kv,
+                                                  n_tokens,
+                                                  DS4_N_HEAD_DIM,
+                                                  DS4_N_ROT) != 0;
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("KVcur", g->batch_kv,
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
@@ -18195,7 +18433,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                          n_tokens,
                                                          DS4_N_ROT,
                                                          compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                                         true,
+                                                         !ds4_kv_cache_tq_enabled(),
                                                          freq_base,
                                                          freq_scale,
                                                          ext_factor,
@@ -18278,7 +18516,7 @@ static bool metal_graph_encode_layer_attention_batch(
                             n_tokens,
                             DS4_N_ROT,
                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                            true,
+                            !ds4_kv_cache_tq_enabled(),
                             freq_base,
                             freq_scale,
                             ext_factor,
@@ -18305,7 +18543,7 @@ static bool metal_graph_encode_layer_attention_batch(
                             n_tokens,
                             DS4_N_ROT,
                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                            true,
+                            !ds4_kv_cache_tq_enabled(),
                             freq_base,
                             freq_scale,
                             ext_factor,
@@ -18394,10 +18632,11 @@ static bool metal_graph_encode_layer_attention_batch(
                     if (ok && emit) {
                         ds4_gpu_tensor *comp_row_view = metal_graph_attn_comp_row_view(g, il, comp_row);
                         ok = comp_row_view &&
-                             ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view,
-                                                                   1,
-                                                                   DS4_N_HEAD_DIM,
-                                                                   DS4_N_ROT) != 0;
+                             (ds4_kv_cache_tq_enabled() ||
+                              ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view,
+                                                                    1,
+                                                                    DS4_N_HEAD_DIM,
+                                                                    DS4_N_ROT) != 0);
                         if (ok) {
                             metal_graph_debug_dump_tensor("KVcompress",
                                                           comp_row_view,
@@ -18797,7 +19036,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               g->batch_q,
                                                                               g->layer_raw_cache[il],
                                                                               metal_graph_attn_comp_read_view(g, il, n_comp),
-                                                                              metal_graph_attn_comp_cache_is_f16(),
+                                                                              metal_graph_attn_comp_cache_format(),
                                                                               g->comp_selected,
                                                                               n_tokens,
                                                                               pos0,
@@ -18826,7 +19065,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                              g->batch_q,
                                                                              g->layer_raw_cache[il],
                                                                              metal_graph_attn_comp_read_view(g, il, n_comp),
-                                                                             metal_graph_attn_comp_cache_is_f16(),
+                                                                             metal_graph_attn_comp_cache_format(),
                                                                              use_comp_mask ? g->comp_mask : NULL,
                                                                              use_comp_mask,
                                                                              n_tokens,
@@ -18911,7 +19150,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                           g->batch_q,
                                                                           g->layer_raw_cache[il],
                                                                           metal_graph_attn_comp_read_view(g, il, n_comp),
-                                                                          metal_graph_attn_comp_cache_is_f16(),
+                                                                          metal_graph_attn_comp_cache_format(),
                                                                           g->comp_selected,
                                                                           n_tokens,
                                                                           pos0,
@@ -18943,7 +19182,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                        g->batch_q,
                                                                        g->batch_kv,
                                                                        metal_graph_attn_comp_read_view(g, il, n_comp),
-                                                                       metal_graph_attn_comp_cache_is_f16(),
+                                                                       metal_graph_attn_comp_cache_format(),
                                                                        n_tokens,
                                                                        n_comp,
                                                                        g->raw_window,
@@ -19038,7 +19277,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               q_view,
                                                                               g->layer_raw_cache[il],
                                                                               metal_graph_attn_comp_read_view(g, il, cur_comp),
-                                                                              metal_graph_attn_comp_cache_is_f16(),
+                                                                              metal_graph_attn_comp_cache_format(),
                                                                               g->comp_selected,
                                                                               1,
                                                                               pos,
@@ -19062,7 +19301,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                  g->raw_cap,
                                                                  raw_start,
                                                                  cur_comp ? metal_graph_attn_comp_read_view(g, il, cur_comp) : NULL,
-                                                                 metal_graph_attn_comp_cache_is_f16(),
+                                                                 metal_graph_attn_comp_cache_format(),
                                                                  cur_comp,
                                                                  comp_mask,
                                                                  n_selected,
@@ -19080,6 +19319,12 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_out", g->batch_heads,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
+    }
+    if (ok && compressed && ds4_kv_cache_tq_enabled()) {
+        ok = ds4_gpu_tq_transform_tensor(g->batch_heads,
+                                          n_tokens * DS4_N_HEAD,
+                                          DS4_N_HEAD_DIM,
+                                          true) != 0;
     }
     if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_heads,
                                             n_tokens,
@@ -21985,6 +22230,12 @@ static int metal_graph_prompt_logits_test(
                             memcpy(gpu_raw_logical + (uint64_t)r * DS4_N_HEAD_DIM,
                                    gpu_raw_phys + (uint64_t)phys * DS4_N_HEAD_DIM,
                                    (size_t)DS4_N_HEAD_DIM * sizeof(float));
+                            if (ds4_kv_cache_tq_enabled()) {
+                                dsv4_tq_transform_row_inplace_cpu(
+                                        gpu_raw_logical + (uint64_t)r * DS4_N_HEAD_DIM,
+                                        DS4_N_HEAD_DIM,
+                                        true);
+                            }
                         }
                         fprintf(stderr,
                                 "ds4: cache trace layer %u raw_n=%u raw_start=%u raw_max=%g raw_rms=%g\n",
@@ -22001,7 +22252,21 @@ static int metal_graph_prompt_logits_test(
                 const uint64_t n = (uint64_t)n_comp * DS4_N_HEAD_DIM;
                 float *gpu_comp = xmalloc((size_t)n * sizeof(float));
                 bool comp_read = false;
-                if (ds4_kv_cache_q8_enabled()) {
+                if (ds4_kv_cache_tq_enabled()) {
+                    const uint32_t bits = ds4_kv_cache_tq_bits();
+                    const uint64_t row_bytes = ds4_gpu_kv_tq_packed_row_bytes(DS4_N_HEAD_DIM, bits);
+                    uint8_t *gpu_comp_packed = xmalloc((size_t)((uint64_t)n_comp * row_bytes));
+                    if (ds4_gpu_tensor_read(g.layer_attn_comp_cache[il], 0,
+                                            gpu_comp_packed, (uint64_t)n_comp * row_bytes) != 0) {
+                        for (uint32_t r = 0; r < n_comp; r++) {
+                            dsv4_tq_kv_unpack_row_cpu(gpu_comp_packed + (uint64_t)r * row_bytes,
+                                                      DS4_N_HEAD_DIM, bits,
+                                                      gpu_comp + (uint64_t)r * DS4_N_HEAD_DIM);
+                        }
+                        comp_read = true;
+                    }
+                    free(gpu_comp_packed);
+                } else if (ds4_kv_cache_q8_enabled()) {
                     const uint64_t row_bytes = ds4_gpu_kv_q8_packed_row_bytes(DS4_N_HEAD_DIM, DS4_N_ROT);
                     uint8_t *gpu_comp_packed = xmalloc((size_t)((uint64_t)n_comp * row_bytes));
                     if (ds4_gpu_tensor_read(g.layer_attn_comp_cache[il], 0,
@@ -24174,6 +24439,147 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_q8_packed(
     }
     return 0;
 }
+
+static DS4_MAYBE_UNUSED int payload_write_tensor_span_tq_packed_as_f32(
+        FILE *fp, const ds4_gpu_tensor *tensor,
+        uint64_t row_offset_rows, uint64_t n_rows,
+        uint32_t head_dim, uint32_t bits,
+        uint8_t *buf, size_t cap, char *err, size_t errlen) {
+    const uint64_t row_bytes = ds4_gpu_kv_tq_packed_row_bytes(head_dim, bits);
+    if (!tensor || row_bytes == 0 ||
+        row_offset_rows > ds4_gpu_tensor_bytes(tensor) / row_bytes ||
+        n_rows > ds4_gpu_tensor_bytes(tensor) / row_bytes - row_offset_rows) {
+        payload_set_err(err, errlen, "session tensor is smaller than the TurboQuant payload");
+        return 1;
+    }
+    const size_t rows_per_chunk = cap / (size_t)(row_bytes + (uint64_t)head_dim * sizeof(float));
+    if (rows_per_chunk == 0) {
+        payload_set_err(err, errlen, "session tensor conversion buffer is too small");
+        return 1;
+    }
+    uint8_t *packed_buf = buf;
+    float *f = (float *)(void *)(buf + rows_per_chunk * row_bytes);
+    uint64_t done = 0;
+    while (done < n_rows) {
+        const size_t n = n_rows - done > (uint64_t)rows_per_chunk
+            ? rows_per_chunk : (size_t)(n_rows - done);
+        if (ds4_gpu_tensor_read(tensor, (row_offset_rows + done) * row_bytes,
+                                packed_buf, (uint64_t)n * row_bytes) == 0) {
+            payload_set_err(err, errlen, "failed to read ROCm TurboQuant session tensor");
+            return 1;
+        }
+        for (size_t r = 0; r < n; r++) {
+            dsv4_tq_kv_unpack_row_cpu(packed_buf + (uint64_t)r * row_bytes,
+                                      head_dim, bits, f + (uint64_t)r * head_dim);
+        }
+        if (payload_write_bytes(fp, f, (uint64_t)n * head_dim * sizeof(float), err, errlen) != 0) return 1;
+        done += n;
+    }
+    return 0;
+}
+
+static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_tq_packed(
+        FILE *fp, ds4_gpu_tensor *tensor,
+        uint64_t row_offset_rows, uint64_t n_rows,
+        uint32_t head_dim, uint32_t bits,
+        uint8_t *buf, size_t cap, uint64_t *remaining, char *err, size_t errlen) {
+    const uint64_t row_bytes = ds4_gpu_kv_tq_packed_row_bytes(head_dim, bits);
+    if (!tensor || row_bytes == 0 ||
+        row_offset_rows > ds4_gpu_tensor_bytes(tensor) / row_bytes ||
+        n_rows > ds4_gpu_tensor_bytes(tensor) / row_bytes - row_offset_rows) {
+        payload_set_err(err, errlen, "session tensor is smaller than the TurboQuant payload");
+        return 1;
+    }
+    const size_t rows_per_chunk = cap / (size_t)(row_bytes + (uint64_t)head_dim * sizeof(float));
+    if (rows_per_chunk == 0) {
+        payload_set_err(err, errlen, "session tensor conversion buffer is too small");
+        return 1;
+    }
+    uint8_t *packed_buf = buf;
+    float *f = (float *)(void *)(buf + rows_per_chunk * row_bytes);
+    uint64_t done = 0;
+    while (done < n_rows) {
+        const size_t n = n_rows - done > (uint64_t)rows_per_chunk
+            ? rows_per_chunk : (size_t)(n_rows - done);
+        if (payload_read_bytes(fp, f, (uint64_t)n * head_dim * sizeof(float), remaining, err, errlen) != 0) return 1;
+        for (size_t r = 0; r < n; r++) {
+            dsv4_tq_kv_pack_row_cpu(f + (uint64_t)r * head_dim,
+                                    head_dim, bits, packed_buf + (uint64_t)r * row_bytes);
+        }
+        if (ds4_gpu_tensor_write(tensor, (row_offset_rows + done) * row_bytes,
+                                 packed_buf, (uint64_t)n * row_bytes) == 0) {
+            payload_set_err(err, errlen, "failed to restore ROCm TurboQuant session tensor");
+            return 1;
+        }
+        done += n;
+    }
+    return 0;
+}
+
+/* TQ mode keeps the small raw SWA ring rotated as F32 so it can share the
+ * transformed query/output basis with compressed rows.  Checkpoints remain in
+ * the stable unrotated F32 format, allowing restore under any cache mode. */
+static DS4_MAYBE_UNUSED int payload_write_tensor_span_tq_rotated_as_f32(
+        FILE *fp, const ds4_gpu_tensor *tensor,
+        uint64_t row_offset_rows, uint64_t n_rows, uint32_t head_dim,
+        uint8_t *buf, size_t cap, char *err, size_t errlen) {
+    const size_t rows_per_chunk = cap / ((size_t)head_dim * sizeof(float));
+    if (!tensor || rows_per_chunk == 0 ||
+        row_offset_rows > ds4_gpu_tensor_bytes(tensor) / ((uint64_t)head_dim * sizeof(float)) ||
+        n_rows > ds4_gpu_tensor_bytes(tensor) / ((uint64_t)head_dim * sizeof(float)) - row_offset_rows) {
+        payload_set_err(err, errlen, "session raw tensor is smaller than the TurboQuant payload");
+        return 1;
+    }
+    float *f = (float *)(void *)buf;
+    uint64_t done = 0;
+    while (done < n_rows) {
+        const size_t n = n_rows - done > (uint64_t)rows_per_chunk
+            ? rows_per_chunk : (size_t)(n_rows - done);
+        if (ds4_gpu_tensor_read(tensor,
+                                (row_offset_rows + done) * head_dim * sizeof(float),
+                                f, (uint64_t)n * head_dim * sizeof(float)) == 0) {
+            payload_set_err(err, errlen, "failed to read rotated TurboQuant raw tensor");
+            return 1;
+        }
+        for (size_t r = 0; r < n; r++) {
+            dsv4_tq_transform_row_inplace_cpu(f + (uint64_t)r * head_dim, head_dim, true);
+        }
+        if (payload_write_bytes(fp, f, (uint64_t)n * head_dim * sizeof(float), err, errlen) != 0) return 1;
+        done += n;
+    }
+    return 0;
+}
+
+static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_tq_rotated(
+        FILE *fp, ds4_gpu_tensor *tensor,
+        uint64_t row_offset_rows, uint64_t n_rows, uint32_t head_dim,
+        uint8_t *buf, size_t cap, uint64_t *remaining, char *err, size_t errlen) {
+    const size_t rows_per_chunk = cap / ((size_t)head_dim * sizeof(float));
+    if (!tensor || rows_per_chunk == 0 ||
+        row_offset_rows > ds4_gpu_tensor_bytes(tensor) / ((uint64_t)head_dim * sizeof(float)) ||
+        n_rows > ds4_gpu_tensor_bytes(tensor) / ((uint64_t)head_dim * sizeof(float)) - row_offset_rows) {
+        payload_set_err(err, errlen, "session raw tensor is smaller than the TurboQuant payload");
+        return 1;
+    }
+    float *f = (float *)(void *)buf;
+    uint64_t done = 0;
+    while (done < n_rows) {
+        const size_t n = n_rows - done > (uint64_t)rows_per_chunk
+            ? rows_per_chunk : (size_t)(n_rows - done);
+        if (payload_read_bytes(fp, f, (uint64_t)n * head_dim * sizeof(float), remaining, err, errlen) != 0) return 1;
+        for (size_t r = 0; r < n; r++) {
+            dsv4_tq_transform_row_inplace_cpu(f + (uint64_t)r * head_dim, head_dim, false);
+        }
+        if (ds4_gpu_tensor_write(tensor,
+                                 (row_offset_rows + done) * head_dim * sizeof(float),
+                                 f, (uint64_t)n * head_dim * sizeof(float)) == 0) {
+            payload_set_err(err, errlen, "failed to restore rotated TurboQuant raw tensor");
+            return 1;
+        }
+        done += n;
+    }
+    return 0;
+}
 #endif
 
 static bool ds4_session_is_cpu(const ds4_session *s) {
@@ -24320,18 +24726,41 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
         for (uint32_t r = 0; rc == 0 && r < raw_live; r++) {
             const uint32_t pos = raw_first + r;
             const uint32_t phys = pos % g->raw_cap;
-            rc = payload_write_tensor_span(fp,
-                                           g->layer_raw_cache[il],
-                                           (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
-                                           (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
-                                           buf,
-                                           DS4_SESSION_IO_CHUNK,
-                                           err,
-                                           errlen);
+            if (ds4_kv_cache_tq_enabled()) {
+                rc = payload_write_tensor_span_tq_rotated_as_f32(fp,
+                                                                 g->layer_raw_cache[il],
+                                                                 phys,
+                                                                 1,
+                                                                 DS4_N_HEAD_DIM,
+                                                                 buf,
+                                                                 DS4_SESSION_IO_CHUNK,
+                                                                 err,
+                                                                 errlen);
+            } else {
+                rc = payload_write_tensor_span(fp,
+                                               g->layer_raw_cache[il],
+                                               (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
+                                               (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                                               buf,
+                                               DS4_SESSION_IO_CHUNK,
+                                               err,
+                                               errlen);
+            }
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (ds4_kv_cache_q8_enabled()) {
+        if (ds4_kv_cache_tq_enabled()) {
+            rc = payload_write_tensor_span_tq_packed_as_f32(fp,
+                                                            g->layer_attn_comp_cache[il],
+                                                            0,
+                                                            (uint64_t)g->layer_n_comp[il],
+                                                            DS4_N_HEAD_DIM,
+                                                            ds4_kv_cache_tq_bits(),
+                                                            buf,
+                                                            DS4_SESSION_IO_CHUNK,
+                                                            err,
+                                                            errlen);
+        } else if (ds4_kv_cache_q8_enabled()) {
             rc = payload_write_tensor_span_q8_packed_as_f32(fp,
                                                             g->layer_attn_comp_cache[il],
                                                             0,
@@ -24542,19 +24971,44 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
         for (uint32_t r = 0; rc == 0 && r < saved_raw_live; r++) {
             const uint32_t pos = raw_first + r;
             const uint32_t phys = pos % g->raw_cap;
-            rc = payload_read_tensor_span(fp,
-                                          g->layer_raw_cache[il],
-                                          (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
-                                          (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
-                                          buf,
-                                          DS4_SESSION_IO_CHUNK,
-                                          &remaining,
-                                          err,
-                                          errlen);
+            if (ds4_kv_cache_tq_enabled()) {
+                rc = payload_read_tensor_span_f32_as_tq_rotated(fp,
+                                                                g->layer_raw_cache[il],
+                                                                phys,
+                                                                1,
+                                                                DS4_N_HEAD_DIM,
+                                                                buf,
+                                                                DS4_SESSION_IO_CHUNK,
+                                                                &remaining,
+                                                                err,
+                                                                errlen);
+            } else {
+                rc = payload_read_tensor_span(fp,
+                                              g->layer_raw_cache[il],
+                                              (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
+                                              (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                                              buf,
+                                              DS4_SESSION_IO_CHUNK,
+                                              &remaining,
+                                              err,
+                                              errlen);
+            }
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (ds4_kv_cache_q8_enabled()) {
+        if (ds4_kv_cache_tq_enabled()) {
+            rc = payload_read_tensor_span_f32_as_tq_packed(fp,
+                                                           g->layer_attn_comp_cache[il],
+                                                           0,
+                                                           (uint64_t)n_comp[i],
+                                                           DS4_N_HEAD_DIM,
+                                                           ds4_kv_cache_tq_bits(),
+                                                           buf,
+                                                           DS4_SESSION_IO_CHUNK,
+                                                           &remaining,
+                                                           err,
+                                                           errlen);
+        } else if (ds4_kv_cache_q8_enabled()) {
             rc = payload_read_tensor_span_f32_as_q8_packed(fp,
                                                            g->layer_attn_comp_cache[il],
                                                            0,
@@ -25047,21 +25501,44 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         for (uint32_t r = 0; rc == 0 && r < raw_live; r++) {
             const uint32_t pos = raw_first + r;
             const uint32_t phys = pos % g->raw_cap;
-            rc = payload_write_tensor_span(fp,
-                                           g->layer_raw_cache[il],
-                                           (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
-                                           (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
-                                           buf,
-                                           DS4_SESSION_IO_CHUNK,
-                                           err,
-                                           errlen);
+            if (ds4_kv_cache_tq_enabled()) {
+                rc = payload_write_tensor_span_tq_rotated_as_f32(fp,
+                                                                 g->layer_raw_cache[il],
+                                                                 phys,
+                                                                 1,
+                                                                 DS4_N_HEAD_DIM,
+                                                                 buf,
+                                                                 DS4_SESSION_IO_CHUNK,
+                                                                 err,
+                                                                 errlen);
+            } else {
+                rc = payload_write_tensor_span(fp,
+                                               g->layer_raw_cache[il],
+                                               (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
+                                               (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                                               buf,
+                                               DS4_SESSION_IO_CHUNK,
+                                               err,
+                                               errlen);
+            }
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
         /* Compressed rows are append-only from row zero, so the live prefix is
          * contiguous.  The two compressor state tensors hold the partial window
          * that will become the next compressed row. */
-        if (ds4_kv_cache_q8_enabled()) {
+        if (ds4_kv_cache_tq_enabled()) {
+            rc = payload_write_tensor_span_tq_packed_as_f32(fp,
+                                                            g->layer_attn_comp_cache[il],
+                                                            0,
+                                                            (uint64_t)g->layer_n_comp[il],
+                                                            DS4_N_HEAD_DIM,
+                                                            ds4_kv_cache_tq_bits(),
+                                                            buf,
+                                                            DS4_SESSION_IO_CHUNK,
+                                                            err,
+                                                            errlen);
+        } else if (ds4_kv_cache_q8_enabled()) {
             rc = payload_write_tensor_span_q8_packed_as_f32(fp,
                                                             g->layer_attn_comp_cache[il],
                                                             0,
@@ -25407,19 +25884,44 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         for (uint32_t r = 0; rc == 0 && r < saved_raw_live; r++) {
             const uint32_t pos = raw_first + r;
             const uint32_t phys = pos % g->raw_cap;
-            rc = payload_read_tensor_span(fp,
-                                          g->layer_raw_cache[il],
-                                          (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
-                                          (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
-                                          buf,
-                                          DS4_SESSION_IO_CHUNK,
-                                          &remaining,
-                                          err,
-                                          errlen);
+            if (ds4_kv_cache_tq_enabled()) {
+                rc = payload_read_tensor_span_f32_as_tq_rotated(fp,
+                                                                g->layer_raw_cache[il],
+                                                                phys,
+                                                                1,
+                                                                DS4_N_HEAD_DIM,
+                                                                buf,
+                                                                DS4_SESSION_IO_CHUNK,
+                                                                &remaining,
+                                                                err,
+                                                                errlen);
+            } else {
+                rc = payload_read_tensor_span(fp,
+                                              g->layer_raw_cache[il],
+                                              (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
+                                              (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                                              buf,
+                                              DS4_SESSION_IO_CHUNK,
+                                              &remaining,
+                                              err,
+                                              errlen);
+            }
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (ds4_kv_cache_q8_enabled()) {
+        if (ds4_kv_cache_tq_enabled()) {
+            rc = payload_read_tensor_span_f32_as_tq_packed(fp,
+                                                           g->layer_attn_comp_cache[il],
+                                                           0,
+                                                           (uint64_t)n_comp[il],
+                                                           DS4_N_HEAD_DIM,
+                                                           ds4_kv_cache_tq_bits(),
+                                                           buf,
+                                                           DS4_SESSION_IO_CHUNK,
+                                                           &remaining,
+                                                           err,
+                                                           errlen);
+        } else if (ds4_kv_cache_q8_enabled()) {
             rc = payload_read_tensor_span_f32_as_q8_packed(fp,
                                                            g->layer_attn_comp_cache[il],
                                                            0,

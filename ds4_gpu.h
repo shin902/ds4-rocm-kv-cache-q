@@ -43,6 +43,13 @@ int ds4_gpu_flush_commands(void);
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
 int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label);
+enum {
+    DS4_GPU_COMP_KV_F32 = 0,
+    DS4_GPU_COMP_KV_F16 = 1,
+    DS4_GPU_COMP_KV_TQ4 = 2,
+    DS4_GPU_COMP_KV_TQ2 = 3,
+};
+
 #ifdef DS4_ROCM_BUILD
 int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              uint64_t offset,
@@ -474,6 +481,29 @@ int ds4_gpu_kv_q8_unpack_tensor(
         uint32_t                head_dim,
         uint32_t                n_rot);
 
+/* TurboQuant MSE rows: full-width RHT, 2/4-bit Lloyd-Max codes and one F16
+ * RMS per row.  Unlike FP8/Q8, ROCm attention consumes these rows directly. */
+uint64_t ds4_gpu_kv_tq_packed_row_bytes(uint32_t head_dim, uint32_t bits);
+int ds4_gpu_kv_tq_pack_tensor(
+        ds4_gpu_tensor       *packed_cache,
+        uint64_t                dst_row_offset_bytes,
+        const ds4_gpu_tensor *rows_f32,
+        uint32_t                n_rows,
+        uint32_t                head_dim,
+        uint32_t                bits);
+int ds4_gpu_kv_tq_unpack_tensor(
+        ds4_gpu_tensor       *out_f32,
+        const ds4_gpu_tensor *packed_cache,
+        uint64_t                src_row_offset_bytes,
+        uint32_t                n_rows,
+        uint32_t                head_dim,
+        uint32_t                bits);
+int ds4_gpu_tq_transform_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t        n_rows,
+        uint32_t        head_dim,
+        bool            inverse);
+
 #endif /* DS4_ROCM_BUILD */
 
 int ds4_gpu_dsv4_indexer_qat_tensor(
@@ -651,7 +681,7 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                raw_cap,
         uint32_t                raw_start,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
+        uint32_t                comp_format,
         uint32_t                n_comp,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
@@ -694,7 +724,7 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
+        uint32_t                comp_format,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
@@ -716,7 +746,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
+        uint32_t                comp_format,
         const ds4_gpu_tensor *topk,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -738,7 +768,7 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
+        uint32_t                comp_format,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
@@ -754,7 +784,7 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
+        uint32_t                comp_format,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                n_tokens,
         uint32_t                n_comp,

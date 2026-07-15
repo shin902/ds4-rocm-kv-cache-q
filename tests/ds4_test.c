@@ -1,6 +1,7 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
 #include "../ds4_server.c"
+#include "../ds4_gpu.h"
 
 /* ROCm packed FP8 compressed-KV cache CPU reference, defined in ds4.c
  * (linked in via CORE_OBJS) but not declared in any public header since it
@@ -14,6 +15,356 @@ void dsv4_fp8_kv_unpack_row_cpu(const uint8_t *row_in, uint32_t head_dim, uint32
 uint64_t dsv4_q8_kv_packed_row_bytes_cpu(uint32_t head_dim, uint32_t n_rot);
 void dsv4_q8_kv_pack_row_cpu(const float *x, uint32_t head_dim, uint32_t n_rot, uint8_t *row_out);
 void dsv4_q8_kv_unpack_row_cpu(const uint8_t *row_in, uint32_t head_dim, uint32_t n_rot, float *x_out);
+void dsv4_tq_transform_row_inplace_cpu(float *x, uint32_t n, bool inverse);
+uint64_t dsv4_tq_kv_packed_row_bytes_cpu(uint32_t head_dim, uint32_t bits);
+void dsv4_tq_kv_pack_row_cpu(const float *x, uint32_t head_dim, uint32_t bits, uint8_t *row_out);
+void dsv4_tq_kv_unpack_row_cpu(const uint8_t *row_in, uint32_t head_dim, uint32_t bits, float *x_out);
+
+static void test_tq_kv_pack_roundtrip(void) {
+    enum { N = 512 };
+    float src[N], transformed[N], got[N];
+    for (uint32_t i = 0; i < N; i++) {
+        src[i] = 0.7f * sinf((float)i * 0.071f) +
+                 0.2f * cosf((float)i * 0.193f) +
+                 (float)((int)(i % 11u) - 5) * 0.013f;
+        transformed[i] = src[i];
+    }
+    dsv4_tq_transform_row_inplace_cpu(transformed, N, false);
+    dsv4_tq_transform_row_inplace_cpu(transformed, N, true);
+    for (uint32_t i = 0; i < N; i++) {
+        TEST_ASSERT(fabsf(transformed[i] - src[i]) < 2.0e-6f);
+    }
+
+    for (uint32_t bits = 2; bits <= 4; bits += 2) {
+        const uint64_t row_bytes = dsv4_tq_kv_packed_row_bytes_cpu(N, bits);
+        TEST_ASSERT(row_bytes == (bits == 4 ? 260u : 132u));
+        uint8_t *packed = calloc(1, (size_t)row_bytes);
+        uint8_t *packed2 = calloc(1, (size_t)row_bytes);
+        TEST_ASSERT(packed != NULL && packed2 != NULL);
+        dsv4_tq_kv_pack_row_cpu(src, N, bits, packed);
+        dsv4_tq_kv_unpack_row_cpu(packed, N, bits, got);
+        dsv4_tq_kv_pack_row_cpu(src, N, bits, packed2);
+        TEST_ASSERT(memcmp(packed, packed2, (size_t)row_bytes) == 0);
+
+        double err2 = 0.0, src2 = 0.0, got2 = 0.0, dot = 0.0;
+        for (uint32_t i = 0; i < N; i++) {
+            const double e = (double)got[i] - src[i];
+            err2 += e * e;
+            src2 += (double)src[i] * src[i];
+            got2 += (double)got[i] * got[i];
+            dot += (double)src[i] * got[i];
+        }
+        const double rel_rmse = sqrt(err2 / src2);
+        const double cosine = dot / sqrt(src2 * got2);
+        TEST_ASSERT(rel_rmse < (bits == 4 ? 0.15 : 0.42));
+        TEST_ASSERT(cosine > (bits == 4 ? 0.98 : 0.90));
+        free(packed2);
+        free(packed);
+    }
+}
+
+#ifdef DS4_ROCM_BUILD
+static void test_tq_kv_gpu_roundtrip(void) {
+    enum { N = 512, ROWS = 3 };
+    float src[ROWS * N], got[ROWS * N], ref[ROWS * N];
+    for (uint32_t r = 0; r < ROWS; r++) {
+        for (uint32_t i = 0; i < N; i++) {
+            src[(uint64_t)r * N + i] =
+                (0.3f + 0.2f * (float)r) * sinf((float)i * (0.031f + 0.007f * (float)r)) +
+                0.17f * cosf((float)i * 0.113f) +
+                (float)((int)(i % 9u) - 4) * 0.021f;
+        }
+    }
+
+    if (ds4_gpu_init() == 0) {
+        fprintf(stderr, "ds4-test: tq-kv-pack-gpu skipped (no ROCm device)\n");
+        return;
+    }
+    ds4_gpu_tensor *rows = ds4_gpu_tensor_alloc(sizeof(src));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(sizeof(src));
+    TEST_ASSERT(rows != NULL && out != NULL);
+    if (!rows || !out) {
+        ds4_gpu_tensor_free(out);
+        ds4_gpu_tensor_free(rows);
+        ds4_gpu_cleanup();
+        return;
+    }
+
+    for (uint32_t bits = 2; bits <= 4; bits += 2) {
+        const uint64_t row_bytes = ds4_gpu_kv_tq_packed_row_bytes(N, bits);
+        ds4_gpu_tensor *packed = ds4_gpu_tensor_alloc(ROWS * row_bytes);
+        TEST_ASSERT(packed != NULL);
+        if (!packed) continue;
+        TEST_ASSERT(ds4_gpu_tensor_write(rows, 0, src, sizeof(src)) != 0);
+        TEST_ASSERT(ds4_gpu_kv_tq_pack_tensor(packed, 0, rows, ROWS, N, bits) != 0);
+        TEST_ASSERT(ds4_gpu_kv_tq_unpack_tensor(out, packed, 0, ROWS, N, bits) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(out, 0, got, sizeof(got)) != 0);
+        for (uint32_t r = 0; r < ROWS; r++) {
+            const uint64_t cpu_row_bytes = dsv4_tq_kv_packed_row_bytes_cpu(N, bits);
+            uint8_t cpu_packed[260];
+            TEST_ASSERT(cpu_row_bytes <= sizeof(cpu_packed));
+            dsv4_tq_kv_pack_row_cpu(src + (uint64_t)r * N, N, bits, cpu_packed);
+            dsv4_tq_kv_unpack_row_cpu(cpu_packed, N, bits, ref + (uint64_t)r * N);
+        }
+        float max_diff = 0.0f;
+        for (uint32_t i = 0; i < ROWS * N; i++) {
+            const float diff = fabsf(got[i] - ref[i]);
+            if (diff > max_diff) max_diff = diff;
+        }
+        TEST_ASSERT(max_diff < 2.0e-4f);
+        ds4_gpu_tensor_free(packed);
+    }
+
+    TEST_ASSERT(ds4_gpu_tensor_write(rows, 0, src, sizeof(src)) != 0);
+    TEST_ASSERT(ds4_gpu_tq_transform_tensor(rows, ROWS, N, false) != 0);
+    TEST_ASSERT(ds4_gpu_tq_transform_tensor(rows, ROWS, N, true) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(rows, 0, got, sizeof(got)) != 0);
+    for (uint32_t i = 0; i < ROWS * N; i++) {
+        TEST_ASSERT(fabsf(got[i] - src[i]) < 3.0e-6f);
+    }
+
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(rows);
+    ds4_gpu_cleanup();
+}
+
+static void test_tq_attention_gpu(void) {
+    enum { N = 512, HEADS = 8, RAW = 3, COMP = 5 };
+    float q[HEADS * N], raw[RAW * N], comp[COMP * N];
+    float got[HEADS * N], ref[HEADS * N], comp_deq[COMP * N];
+    float sinks[HEADS];
+    for (uint32_t h = 0; h < HEADS; h++) {
+        sinks[h] = -0.15f + 0.04f * (float)h;
+        for (uint32_t i = 0; i < N; i++) {
+            q[(uint64_t)h * N + i] =
+                0.31f * sinf((float)i * (0.019f + 0.001f * (float)h)) +
+                0.13f * cosf((float)i * 0.077f + (float)h);
+        }
+    }
+    for (uint32_t r = 0; r < RAW; r++) {
+        for (uint32_t i = 0; i < N; i++) {
+            raw[(uint64_t)r * N + i] =
+                0.27f * sinf((float)i * 0.043f + (float)r * 0.7f) +
+                0.11f * cosf((float)i * 0.097f - (float)r);
+        }
+    }
+    for (uint32_t r = 0; r < COMP; r++) {
+        for (uint32_t i = 0; i < N; i++) {
+            comp[(uint64_t)r * N + i] =
+                0.33f * sinf((float)i * (0.029f + 0.003f * (float)r)) +
+                0.16f * cosf((float)i * 0.059f + (float)r * 0.4f);
+        }
+    }
+
+    if (ds4_gpu_init() == 0) {
+        fprintf(stderr, "ds4-test: tq-attention-gpu skipped (no ROCm device)\n");
+        return;
+    }
+    ds4_gpu_tensor *q_gpu = ds4_gpu_tensor_alloc(sizeof(q));
+    ds4_gpu_tensor *raw_gpu = ds4_gpu_tensor_alloc(sizeof(raw));
+    ds4_gpu_tensor *comp_gpu = ds4_gpu_tensor_alloc(sizeof(comp));
+    ds4_gpu_tensor *heads_gpu = ds4_gpu_tensor_alloc(sizeof(got));
+    const int32_t topk_rows[3] = {4, 1, 3};
+    ds4_gpu_tensor *topk_gpu = ds4_gpu_tensor_alloc(sizeof(topk_rows));
+    TEST_ASSERT(q_gpu && raw_gpu && comp_gpu && heads_gpu && topk_gpu);
+    if (topk_gpu) TEST_ASSERT(ds4_gpu_tensor_write(topk_gpu, 0, topk_rows, sizeof(topk_rows)) != 0);
+
+    for (uint32_t bits = 2; q_gpu && raw_gpu && comp_gpu && heads_gpu && topk_gpu && bits <= 4; bits += 2) {
+        const uint64_t row_bytes = ds4_gpu_kv_tq_packed_row_bytes(N, bits);
+        ds4_gpu_tensor *packed_gpu = ds4_gpu_tensor_alloc(COMP * row_bytes);
+        TEST_ASSERT(packed_gpu != NULL);
+        if (!packed_gpu) continue;
+        TEST_ASSERT(ds4_gpu_tensor_write(q_gpu, 0, q, sizeof(q)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(raw_gpu, 0, raw, sizeof(raw)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(comp_gpu, 0, comp, sizeof(comp)) != 0);
+        TEST_ASSERT(ds4_gpu_tq_transform_tensor(q_gpu, HEADS, N, false) != 0);
+        TEST_ASSERT(ds4_gpu_tq_transform_tensor(raw_gpu, RAW, N, false) != 0);
+        TEST_ASSERT(ds4_gpu_kv_tq_pack_tensor(packed_gpu, 0, comp_gpu, COMP, N, bits) != 0);
+        TEST_ASSERT(ds4_gpu_attention_decode_heads_tensor(
+                heads_gpu, sinks, sizeof(sinks), 0,
+                q_gpu, raw_gpu, RAW, RAW, 0,
+                packed_gpu,
+                bits == 2 ? DS4_GPU_COMP_KV_TQ2 : DS4_GPU_COMP_KV_TQ4,
+                COMP, NULL, 0, HEADS, N) != 0);
+        TEST_ASSERT(ds4_gpu_tq_transform_tensor(heads_gpu, HEADS, N, true) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(heads_gpu, 0, got, sizeof(got)) != 0);
+
+        for (uint32_t r = 0; r < COMP; r++) {
+            uint8_t packed_cpu[260];
+            dsv4_tq_kv_pack_row_cpu(comp + (uint64_t)r * N, N, bits, packed_cpu);
+            dsv4_tq_kv_unpack_row_cpu(packed_cpu, N, bits,
+                                      comp_deq + (uint64_t)r * N);
+        }
+        const float inv_scale = 1.0f / sqrtf((float)N);
+        for (uint32_t h = 0; h < HEADS; h++) {
+            const float *qh = q + (uint64_t)h * N;
+            float scores[RAW + COMP];
+            float max_score = sinks[h];
+            for (uint32_t r = 0; r < RAW + COMP; r++) {
+                const float *kv = r < RAW
+                    ? raw + (uint64_t)r * N
+                    : comp_deq + (uint64_t)(r - RAW) * N;
+                float dot = 0.0f;
+                for (uint32_t i = 0; i < N; i++) dot += qh[i] * kv[i];
+                scores[r] = dot * inv_scale;
+                if (scores[r] > max_score) max_score = scores[r];
+            }
+            float denom = expf(sinks[h] - max_score);
+            for (uint32_t r = 0; r < RAW + COMP; r++) denom += expf(scores[r] - max_score);
+            for (uint32_t i = 0; i < N; i++) {
+                float value = 0.0f;
+                for (uint32_t r = 0; r < RAW + COMP; r++) {
+                    const float *kv = r < RAW
+                        ? raw + (uint64_t)r * N
+                        : comp_deq + (uint64_t)(r - RAW) * N;
+                    value += kv[i] * expf(scores[r] - max_score);
+                }
+                ref[(uint64_t)h * N + i] = value / denom;
+            }
+        }
+        float max_diff = 0.0f;
+        for (uint32_t i = 0; i < HEADS * N; i++) {
+            const float diff = fabsf(got[i] - ref[i]);
+            if (diff > max_diff) max_diff = diff;
+        }
+        TEST_ASSERT(max_diff < 5.0e-4f);
+
+        TEST_ASSERT(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                heads_gpu, sinks, sizeof(sinks), 0,
+                q_gpu, raw_gpu, packed_gpu,
+                bits == 2 ? DS4_GPU_COMP_KV_TQ2 : DS4_GPU_COMP_KV_TQ4,
+                topk_gpu, 1, 31, RAW, RAW, 0, COMP, 3, 128, 4, HEADS, N) != 0);
+        TEST_ASSERT(ds4_gpu_tq_transform_tensor(heads_gpu, HEADS, N, true) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(heads_gpu, 0, got, sizeof(got)) != 0);
+        for (uint32_t h = 0; h < HEADS; h++) {
+            const float *qh = q + (uint64_t)h * N;
+            float scores[RAW + 3];
+            float max_score = sinks[h];
+            for (uint32_t r = 0; r < RAW + 3; r++) {
+                const float *kv = r < RAW
+                    ? raw + (uint64_t)r * N
+                    : comp_deq + (uint64_t)topk_rows[r - RAW] * N;
+                float dot = 0.0f;
+                for (uint32_t i = 0; i < N; i++) dot += qh[i] * kv[i];
+                scores[r] = dot * inv_scale;
+                if (scores[r] > max_score) max_score = scores[r];
+            }
+            float denom = expf(sinks[h] - max_score);
+            for (uint32_t r = 0; r < RAW + 3; r++) denom += expf(scores[r] - max_score);
+            for (uint32_t i = 0; i < N; i++) {
+                float value = 0.0f;
+                for (uint32_t r = 0; r < RAW + 3; r++) {
+                    const float *kv = r < RAW
+                        ? raw + (uint64_t)r * N
+                        : comp_deq + (uint64_t)topk_rows[r - RAW] * N;
+                    value += kv[i] * expf(scores[r] - max_score);
+                }
+                ref[(uint64_t)h * N + i] = value / denom;
+            }
+        }
+        max_diff = 0.0f;
+        for (uint32_t i = 0; i < HEADS * N; i++) {
+            const float diff = fabsf(got[i] - ref[i]);
+            if (diff > max_diff) max_diff = diff;
+        }
+        TEST_ASSERT(max_diff < 5.0e-4f);
+        ds4_gpu_tensor_free(packed_gpu);
+    }
+
+    /* Ratio-128 prefill reaches the compressed cache only after token 127.
+     * Exercise that boundary through the static direct-attention kernel. */
+    enum { PREFILL_TOKENS = 129 };
+    const uint64_t pq_count = (uint64_t)PREFILL_TOKENS * HEADS * N;
+    const uint64_t pr_count = (uint64_t)PREFILL_TOKENS * N;
+    float *pq = malloc((size_t)pq_count * sizeof(float));
+    float *pr = malloc((size_t)pr_count * sizeof(float));
+    ds4_gpu_tensor *pq_gpu = ds4_gpu_tensor_alloc(pq_count * sizeof(float));
+    ds4_gpu_tensor *pr_gpu = ds4_gpu_tensor_alloc(pr_count * sizeof(float));
+    ds4_gpu_tensor *ph_gpu = ds4_gpu_tensor_alloc(pq_count * sizeof(float));
+    const uint64_t tq4_row_bytes = ds4_gpu_kv_tq_packed_row_bytes(N, 4);
+    ds4_gpu_tensor *packed_one = ds4_gpu_tensor_alloc(tq4_row_bytes);
+    TEST_ASSERT(pq && pr && pq_gpu && pr_gpu && ph_gpu && packed_one);
+    if (pq && pr && pq_gpu && pr_gpu && ph_gpu && packed_one) {
+        for (uint32_t t = 0; t < PREFILL_TOKENS; t++) {
+            for (uint32_t h = 0; h < HEADS; h++) {
+                for (uint32_t i = 0; i < N; i++) {
+                    pq[((uint64_t)t * HEADS + h) * N + i] =
+                        0.24f * sinf((float)i * 0.021f + (float)t * 0.013f) +
+                        0.09f * cosf((float)i * 0.081f + (float)h * 0.2f);
+                }
+            }
+            for (uint32_t i = 0; i < N; i++) {
+                pr[(uint64_t)t * N + i] =
+                    0.29f * sinf((float)i * 0.037f + (float)t * 0.017f) +
+                    0.12f * cosf((float)i * 0.071f - (float)t * 0.01f);
+            }
+        }
+        TEST_ASSERT(ds4_gpu_tensor_write(pq_gpu, 0, pq, pq_count * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(pr_gpu, 0, pr, pr_count * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(comp_gpu, 0, comp, sizeof(comp)) != 0);
+        TEST_ASSERT(ds4_gpu_tq_transform_tensor(pq_gpu, PREFILL_TOKENS * HEADS, N, false) != 0);
+        TEST_ASSERT(ds4_gpu_tq_transform_tensor(pr_gpu, PREFILL_TOKENS, N, false) != 0);
+        TEST_ASSERT(ds4_gpu_kv_tq_pack_tensor(packed_one, 0, comp_gpu, 1, N, 4) != 0);
+        TEST_ASSERT(ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+                ph_gpu, sinks, sizeof(sinks), 0, pq_gpu, pr_gpu, packed_one,
+                DS4_GPU_COMP_KV_TQ4, PREFILL_TOKENS, 1, 128, 128, HEADS, N) != 0);
+        ds4_gpu_tensor *last_heads = ds4_gpu_tensor_view(
+                ph_gpu, (uint64_t)(PREFILL_TOKENS - 1) * HEADS * N * sizeof(float),
+                sizeof(got));
+        TEST_ASSERT(last_heads != NULL);
+        if (last_heads) {
+            TEST_ASSERT(ds4_gpu_tq_transform_tensor(last_heads, HEADS, N, true) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(last_heads, 0, got, sizeof(got)) != 0);
+            uint8_t packed_cpu[260];
+            dsv4_tq_kv_pack_row_cpu(comp, N, 4, packed_cpu);
+            dsv4_tq_kv_unpack_row_cpu(packed_cpu, N, 4, comp_deq);
+            const float inv_scale = 1.0f / sqrtf((float)N);
+            for (uint32_t h = 0; h < HEADS; h++) {
+                const float *qh = pq + ((uint64_t)(PREFILL_TOKENS - 1) * HEADS + h) * N;
+                float scores[129];
+                float max_score = sinks[h];
+                for (uint32_t r = 0; r < 129; r++) {
+                    const float *kv = r < 128 ? pr + (uint64_t)(r + 1) * N : comp_deq;
+                    float dot = 0.0f;
+                    for (uint32_t i = 0; i < N; i++) dot += qh[i] * kv[i];
+                    scores[r] = dot * inv_scale;
+                    if (scores[r] > max_score) max_score = scores[r];
+                }
+                float denom = expf(sinks[h] - max_score);
+                for (uint32_t r = 0; r < 129; r++) denom += expf(scores[r] - max_score);
+                for (uint32_t i = 0; i < N; i++) {
+                    float value = 0.0f;
+                    for (uint32_t r = 0; r < 129; r++) {
+                        const float *kv = r < 128 ? pr + (uint64_t)(r + 1) * N : comp_deq;
+                        value += kv[i] * expf(scores[r] - max_score);
+                    }
+                    ref[(uint64_t)h * N + i] = value / denom;
+                }
+            }
+            float max_diff = 0.0f;
+            for (uint32_t i = 0; i < HEADS * N; i++) {
+                const float diff = fabsf(got[i] - ref[i]);
+                if (diff > max_diff) max_diff = diff;
+            }
+            TEST_ASSERT(max_diff < 7.0e-4f);
+        }
+        ds4_gpu_tensor_free(last_heads);
+    }
+    ds4_gpu_tensor_free(packed_one);
+    ds4_gpu_tensor_free(ph_gpu);
+    ds4_gpu_tensor_free(pr_gpu);
+    ds4_gpu_tensor_free(pq_gpu);
+    free(pr);
+    free(pq);
+
+    ds4_gpu_tensor_free(topk_gpu);
+    ds4_gpu_tensor_free(heads_gpu);
+    ds4_gpu_tensor_free(comp_gpu);
+    ds4_gpu_tensor_free(raw_gpu);
+    ds4_gpu_tensor_free(q_gpu);
+    ds4_gpu_cleanup();
+}
+#endif
 
 static void test_q8_kv_pack_roundtrip(void) {
     static const uint32_t head_dims[] = {512u, 128u, 64u};
@@ -2354,6 +2705,11 @@ static const ds4_test_entry test_entries[] = {
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--fp8-kv-pack", "fp8-kv-pack", "ROCm packed FP8 compressed-KV cache pack/unpack matches the FP8 round-trip reference", test_fp8_kv_pack_roundtrip},
     {"--q8-kv-pack", "q8-kv-pack", "ROCm packed Q8 compressed-KV cache pack/unpack stays within Q8 error bounds", test_q8_kv_pack_roundtrip},
+    {"--tq-kv-pack", "tq-kv-pack", "TurboQuant TQ4/TQ2 RHT packed-row reference roundtrip", test_tq_kv_pack_roundtrip},
+#ifdef DS4_ROCM_BUILD
+    {"--tq-kv-pack-gpu", "tq-kv-pack-gpu", "ROCm TurboQuant transform and packed-row kernels match the CPU reference", test_tq_kv_gpu_roundtrip},
+    {"--tq-attention-gpu", "tq-attention-gpu", "ROCm attention directly consumes TQ4/TQ2 rows without F32 expansion", test_tq_attention_gpu},
+#endif
 };
 
 static void test_print_help(const char *prog) {
