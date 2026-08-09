@@ -8,6 +8,24 @@
 #define DS4_ROCM_ATTENTION_INDEXED_SCORE_CAP \
     (256u + DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP)
 
+__device__ __forceinline__ static float4 attention_comp_float4(
+        const void *comp_kv, uint32_t row, uint32_t c4,
+        uint32_t head_dim, uint32_t comp_format, uint64_t packed_row_bytes) {
+    if (comp_format == DS4_GPU_COMP_KV_TQ4 || comp_format == DS4_GPU_COMP_KV_TQ2) {
+        const uint32_t bits = comp_format == DS4_GPU_COMP_KV_TQ2 ? 2u : 4u;
+        const uint8_t *packed = (const uint8_t *)comp_kv + (uint64_t)row * packed_row_bytes;
+        const uint32_t d = c4 << 2u;
+        const uint32_t code_bytes = (head_dim * bits + 7u) >> 3u;
+        const uint16_t rms_h = ((const uint16_t *)(const void *)(packed + code_bytes))[0];
+        const float rms = f16_bits_to_f32(rms_h);
+        return make_float4(tq_centroid_dev(tq_packed_code_dev(packed, d + 0u, bits), bits) * rms,
+                           tq_centroid_dev(tq_packed_code_dev(packed, d + 1u, bits), bits) * rms,
+                           tq_centroid_dev(tq_packed_code_dev(packed, d + 2u, bits), bits) * rms,
+                           tq_centroid_dev(tq_packed_code_dev(packed, d + 3u, bits), bits) * rms);
+    }
+    return ((const float4 *)comp_kv)[(uint64_t)row * (head_dim >> 2u) + c4];
+}
+
 __global__ static void attention_prefill_raw_kernel(
         float *heads,
         const float *sinks,
@@ -1031,7 +1049,9 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
         const float *sinks,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const void *comp_kv,
+        uint32_t comp_format,
+        uint64_t packed_row_bytes,
         const int32_t *topk,
         uint32_t n_tokens,
         uint32_t pos0,
@@ -1128,10 +1148,14 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_rows[sr - raw_count] * head_dim);
-            kv_shared[off] = src[c4];
+            if (sr < raw_count) {
+                const float4 *src = (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim);
+                kv_shared[off] = src[c4];
+            } else {
+                kv_shared[off] = attention_comp_float4(comp_kv,
+                        comp_rows[sr - raw_count], c4, head_dim,
+                        comp_format, packed_row_bytes);
+            }
         }
         __syncthreads();
         if (valid_head) {
@@ -1193,7 +1217,9 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         const float *sinks,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const void *comp_kv,
+        uint32_t comp_format,
+        uint64_t packed_row_bytes,
         uint32_t n_tokens,
         uint32_t n_comp,
         uint32_t window,
@@ -1220,6 +1246,95 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)head_dim);
 
+    /* Packed TurboQuant rows cannot fall back to the GEMM path without first
+     * materializing an F32 cache.  Consume them directly with a streaming
+     * softmax, which also removes the 768-row limit of the legacy fast path. */
+    if (comp_format == DS4_GPU_COMP_KV_TQ4 || comp_format == DS4_GPU_COMP_KV_TQ2) {
+        const float4 *q4 = valid_head
+            ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
+            : NULL;
+        float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float4 q1 = q0, q2 = q0, q3 = q0;
+        if (valid_head) {
+            q0 = q4[lane +  0u];
+            q1 = q4[lane + 32u];
+            q2 = q4[lane + 64u];
+            q3 = q4[lane + 96u];
+        }
+
+        float max_s = valid_head ? sinks[head] : -INFINITY;
+        float sum_s = valid_head ? 1.0f : 0.0f;
+        float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float4 o1 = o0, o2 = o0, o3 = o0;
+        for (uint32_t row0 = 0; row0 < n_score; row0 += 4u) {
+            const uint32_t nr = n_score - row0 < 4u ? n_score - row0 : 4u;
+            for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
+                const uint32_t rr = off >> 7u;
+                const uint32_t c4 = off & 127u;
+                const uint32_t sr = row0 + rr;
+                if (sr < raw_count) {
+                    const float4 *src = (const float4 *)(raw_kv +
+                            (uint64_t)(raw_start + sr) * head_dim);
+                    kv_shared[off] = src[c4];
+                } else {
+                    kv_shared[off] = attention_comp_float4(comp_kv,
+                            sr - raw_count, c4, head_dim,
+                            comp_format, packed_row_bytes);
+                }
+            }
+            __syncthreads();
+            if (valid_head) {
+                for (uint32_t rr = 0; rr < nr; rr++) {
+                    const float4 *kv4 = kv_shared + rr * 128u;
+                    const float4 k0 = kv4[lane +  0u];
+                    const float4 k1 = kv4[lane + 32u];
+                    const float4 k2 = kv4[lane + 64u];
+                    const float4 k3 = kv4[lane + 96u];
+                    float score = dot4_f32(q0, k0) + dot4_f32(q1, k1) +
+                                  dot4_f32(q2, k2) + dot4_f32(q3, k3);
+                    score = warp_sum_f32(score) * scale;
+                    score = __shfl_sync(FULL_WARP_MASK, score, 0);
+                    const float new_m = fmaxf(max_s, score);
+                    const float old_scale = expf(max_s - new_m);
+                    const float row_scale = expf(score - new_m);
+                    sum_s = sum_s * old_scale + row_scale;
+                    o0.x = o0.x * old_scale + k0.x * row_scale;
+                    o0.y = o0.y * old_scale + k0.y * row_scale;
+                    o0.z = o0.z * old_scale + k0.z * row_scale;
+                    o0.w = o0.w * old_scale + k0.w * row_scale;
+                    o1.x = o1.x * old_scale + k1.x * row_scale;
+                    o1.y = o1.y * old_scale + k1.y * row_scale;
+                    o1.z = o1.z * old_scale + k1.z * row_scale;
+                    o1.w = o1.w * old_scale + k1.w * row_scale;
+                    o2.x = o2.x * old_scale + k2.x * row_scale;
+                    o2.y = o2.y * old_scale + k2.y * row_scale;
+                    o2.z = o2.z * old_scale + k2.z * row_scale;
+                    o2.w = o2.w * old_scale + k2.w * row_scale;
+                    o3.x = o3.x * old_scale + k3.x * row_scale;
+                    o3.y = o3.y * old_scale + k3.y * row_scale;
+                    o3.z = o3.z * old_scale + k3.z * row_scale;
+                    o3.w = o3.w * old_scale + k3.w * row_scale;
+                    max_s = new_m;
+                }
+            }
+            __syncthreads();
+        }
+        if (valid_head) {
+            const float inv_s = sum_s == 0.0f ? 0.0f : 1.0f / sum_s;
+            o0.x *= inv_s; o0.y *= inv_s; o0.z *= inv_s; o0.w *= inv_s;
+            o1.x *= inv_s; o1.y *= inv_s; o1.z *= inv_s; o1.w *= inv_s;
+            o2.x *= inv_s; o2.y *= inv_s; o2.z *= inv_s; o2.w *= inv_s;
+            o3.x *= inv_s; o3.y *= inv_s; o3.z *= inv_s; o3.w *= inv_s;
+            float4 *out4 = (float4 *)(heads +
+                    ((uint64_t)t * n_head + head) * head_dim);
+            out4[lane +  0u] = o0;
+            out4[lane + 32u] = o1;
+            out4[lane + 64u] = o2;
+            out4[lane + 96u] = o3;
+        }
+        return;
+    }
+
     /* Keep the fast heads8 staging, but use the same two-pass score/softmax
      * shape as the old-HIP warprows path.  The previous online recurrence was
      * close, but crossed greedy near-ties on long prompts. */
@@ -1232,10 +1347,13 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
-            kv_shared[off] = src[c4];
+            if (sr < raw_count) {
+                const float4 *src = (const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim);
+                kv_shared[off] = src[c4];
+            } else {
+                kv_shared[off] = attention_comp_float4(comp_kv, sr - raw_count,
+                        c4, head_dim, comp_format, packed_row_bytes);
+            }
         }
         __syncthreads();
         if (valid_head) {
@@ -1280,10 +1398,13 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
-            kv_shared[off] = src[c4];
+            if (sr < raw_count) {
+                const float4 *src = (const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim);
+                kv_shared[off] = src[c4];
+            } else {
+                kv_shared[off] = attention_comp_float4(comp_kv, sr - raw_count,
+                        c4, head_dim, comp_format, packed_row_bytes);
+            }
         }
         __syncthreads();
         if (valid_head) {
@@ -1317,7 +1438,9 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         const float *sinks,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const void *comp_kv,
+        uint32_t comp_format,
+        uint64_t packed_row_bytes,
         uint32_t n_tokens,
         uint32_t pos0,
         uint32_t n_raw,
@@ -1404,10 +1527,13 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
-            kv_shared[off] = src[c4];
+            if (sr < raw_count) {
+                const float4 *src = (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim);
+                kv_shared[off] = src[c4];
+            } else {
+                kv_shared[off] = attention_comp_float4(comp_kv, sr - raw_count,
+                        c4, head_dim, comp_format, packed_row_bytes);
+            }
         }
         __syncthreads();
         if (valid_head) {
@@ -1440,10 +1566,13 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
-            kv_shared[off] = src[c4];
+            if (sr < raw_count) {
+                const float4 *src = (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim);
+                kv_shared[off] = src[c4];
+            } else {
+                kv_shared[off] = attention_comp_float4(comp_kv, sr - raw_count,
+                        c4, head_dim, comp_format, packed_row_bytes);
+            }
         }
         __syncthreads();
         if (valid_head) {

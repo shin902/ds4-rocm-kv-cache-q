@@ -199,6 +199,170 @@ __global__ static void q8_kv_unpack_nonrope_kernel(
     }
 }
 
+/* TurboQuant MSE helpers.  The hash and transform order match ds4.c's CPU
+ * oracle exactly; keeping them data-oblivious lets every layer share one
+ * format without a rotation matrix allocation. */
+__device__ __forceinline__ static uint32_t tq_sign_bit_dev(uint32_t i) {
+    uint32_t x = i + 0x9e3779b9u;
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x >> 31;
+}
+
+__device__ __constant__ static float tq2_centroids_dev[4] = {
+    -1.510417608f, -0.452780035f, 0.452780035f, 1.510417608f,
+};
+
+__device__ __constant__ static float tq4_centroids_dev[16] = {
+    -2.732589571f, -2.069017227f, -1.618046386f, -1.256231197f,
+    -0.942340456f, -0.656759119f, -0.388048299f, -0.128395030f,
+     0.128395030f,  0.388048299f,  0.656759119f,  0.942340456f,
+     1.256231197f,  1.618046386f,  2.069017227f,  2.732589571f,
+};
+
+__device__ __forceinline__ static float tq_centroid_dev(uint32_t code, uint32_t bits) {
+    return bits == 4u ? tq4_centroids_dev[code & 15u]
+                      : tq2_centroids_dev[code & 3u];
+}
+
+__device__ __forceinline__ static uint32_t tq_quantize_code_dev(float x, uint32_t bits) {
+    const uint32_t levels = 1u << bits;
+    uint32_t best = 0;
+    float best_diff = fabsf(x - tq_centroid_dev(0, bits));
+    for (uint32_t i = 1; i < levels; i++) {
+        const float diff = fabsf(x - tq_centroid_dev(i, bits));
+        if (diff < best_diff) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    return best;
+}
+
+__device__ __forceinline__ static float tq_packed_value_dev(
+        const uint8_t *row, uint32_t d, uint32_t head_dim, uint32_t bits) {
+    const uint32_t bit = d * bits;
+    const uint32_t code = (row[bit >> 3u] >> (bit & 7u)) & ((1u << bits) - 1u);
+    const uint32_t code_bytes = (head_dim * bits + 7u) >> 3u;
+    const uint16_t rms_h = ((const uint16_t *)(const void *)(row + code_bytes))[0];
+    return tq_centroid_dev(code, bits) * f16_bits_to_f32(rms_h);
+}
+
+__device__ __forceinline__ static uint32_t tq_packed_code_dev(
+        const uint8_t *row, uint32_t d, uint32_t bits) {
+    const uint32_t bit = d * bits;
+    return (row[bit >> 3u] >> (bit & 7u)) & ((1u << bits) - 1u);
+}
+
+__global__ static void tq_transform_rows_kernel(
+        float *rows, uint32_t n_rows, uint32_t head_dim, uint32_t inverse) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (row >= n_rows || tid >= head_dim) return;
+    extern __shared__ float y[];
+    float v = rows[(uint64_t)row * head_dim + tid];
+    if (!inverse && tq_sign_bit_dev(tid)) v = -v;
+    y[tid] = v;
+    __syncthreads();
+    for (uint32_t width = 1u; width < head_dim; width <<= 1u) {
+        if (tid < head_dim / 2u) {
+            const uint32_t group = tid / width;
+            const uint32_t j = tid - group * width;
+            const uint32_t a = group * (width << 1u) + j;
+            const uint32_t b = a + width;
+            const float va = y[a], vb = y[b];
+            y[a] = va + vb;
+            y[b] = va - vb;
+        }
+        __syncthreads();
+    }
+    v = y[tid] * rsqrtf((float)head_dim);
+    if (inverse && tq_sign_bit_dev(tid)) v = -v;
+    rows[(uint64_t)row * head_dim + tid] = v;
+}
+
+__global__ static void tq_kv_pack_rows_kernel(
+        uint8_t *packed, uint64_t row_bytes, const float *rows,
+        uint32_t n_rows, uint32_t head_dim, uint32_t bits) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (row >= n_rows || tid >= head_dim) return;
+    extern __shared__ float sh[];
+    float *y = sh;
+    float *sum = sh + head_dim;
+    float v = rows[(uint64_t)row * head_dim + tid];
+    y[tid] = tq_sign_bit_dev(tid) ? -v : v;
+    sum[tid] = v * v;
+    __syncthreads();
+    for (uint32_t stride = head_dim >> 1u; stride != 0u; stride >>= 1u) {
+        if (tid < stride) sum[tid] += sum[tid + stride];
+        __syncthreads();
+    }
+    for (uint32_t width = 1u; width < head_dim; width <<= 1u) {
+        if (tid < head_dim / 2u) {
+            const uint32_t group = tid / width;
+            const uint32_t j = tid - group * width;
+            const uint32_t a = group * (width << 1u) + j;
+            const uint32_t b = a + width;
+            const float va = y[a], vb = y[b];
+            y[a] = va + vb;
+            y[b] = va - vb;
+        }
+        __syncthreads();
+    }
+    const float rms = sqrtf(sum[0] / (float)head_dim);
+    const float norm = rsqrtf((float)head_dim);
+    const float inv_rms = rms > 0.0f ? 1.0f / rms : 0.0f;
+    const uint32_t code_bytes = (head_dim * bits + 7u) >> 3u;
+    uint8_t *out = packed + (uint64_t)row * row_bytes;
+    const uint32_t per_byte = 8u / bits;
+    if (tid < code_bytes) {
+        uint32_t byte = 0;
+        for (uint32_t j = 0; j < per_byte; j++) {
+            const uint32_t d = tid * per_byte + j;
+            if (d < head_dim) {
+                const uint32_t code = tq_quantize_code_dev(y[d] * norm * inv_rms, bits);
+                byte |= code << (j * bits);
+            }
+        }
+        out[tid] = (uint8_t)byte;
+    }
+    if (tid == 0u) {
+        ((uint16_t *)(void *)(out + code_bytes))[0] = f32_to_f16_bits_hip_round(rms);
+        for (uint32_t i = code_bytes + 2u; i < row_bytes; i++) out[i] = 0;
+    }
+}
+
+__global__ static void tq_kv_unpack_rows_kernel(
+        float *rows, const uint8_t *packed, uint64_t row_bytes,
+        uint32_t n_rows, uint32_t head_dim, uint32_t bits) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (row >= n_rows || tid >= head_dim) return;
+    extern __shared__ float y[];
+    const uint8_t *in = packed + (uint64_t)row * row_bytes;
+    y[tid] = tq_packed_value_dev(in, tid, head_dim, bits);
+    __syncthreads();
+    for (uint32_t width = 1u; width < head_dim; width <<= 1u) {
+        if (tid < head_dim / 2u) {
+            const uint32_t group = tid / width;
+            const uint32_t j = tid - group * width;
+            const uint32_t a = group * (width << 1u) + j;
+            const uint32_t b = a + width;
+            const float va = y[a], vb = y[b];
+            y[a] = va + vb;
+            y[b] = va - vb;
+        }
+        __syncthreads();
+    }
+    float v = y[tid] * rsqrtf((float)head_dim);
+    if (tq_sign_bit_dev(tid)) v = -v;
+    rows[(uint64_t)row * head_dim + tid] = v;
+}
+
 __global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * head_dim;

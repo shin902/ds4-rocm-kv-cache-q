@@ -199,3 +199,56 @@ extern "C" int ds4_gpu_kv_q8_unpack_tensor(
     }
     return 1;
 }
+
+static int ds4_rocm_tq_dim_supported(uint32_t n) {
+    return n != 0u && n <= 512u && (n & (n - 1u)) == 0u;
+}
+
+extern "C" uint64_t ds4_gpu_kv_tq_packed_row_bytes(uint32_t head_dim, uint32_t bits) {
+    if (!ds4_rocm_tq_dim_supported(head_dim) || (bits != 2u && bits != 4u)) return 0;
+    const uint64_t bytes = ((uint64_t)head_dim * bits + 7u) / 8u + sizeof(uint16_t);
+    return (bytes + 3u) & ~3ull;
+}
+
+extern "C" int ds4_gpu_kv_tq_pack_tensor(
+        ds4_gpu_tensor *packed_cache, uint64_t dst_row_offset_bytes,
+        const ds4_gpu_tensor *rows_f32, uint32_t n_rows,
+        uint32_t head_dim, uint32_t bits) {
+    if (!packed_cache || !rows_f32 || !ds4_rocm_tq_dim_supported(head_dim)) return 0;
+    if (n_rows == 0u) return 1;
+    const uint64_t row_bytes = ds4_gpu_kv_tq_packed_row_bytes(head_dim, bits);
+    if (row_bytes == 0 || !cuda_tensor_has_elems2(rows_f32, n_rows, head_dim, sizeof(float)) ||
+        dst_row_offset_bytes > packed_cache->bytes ||
+        (uint64_t)n_rows * row_bytes > packed_cache->bytes - dst_row_offset_bytes) return 0;
+    uint8_t *dst = (uint8_t *)packed_cache->ptr + dst_row_offset_bytes;
+    tq_kv_pack_rows_kernel<<<n_rows, head_dim, (size_t)head_dim * 2u * sizeof(float)>>>(
+            dst, row_bytes, (const float *)rows_f32->ptr, n_rows, head_dim, bits);
+    return cuda_ok(cudaGetLastError(), "TurboQuant KV pack launch");
+}
+
+extern "C" int ds4_gpu_kv_tq_unpack_tensor(
+        ds4_gpu_tensor *out_f32, const ds4_gpu_tensor *packed_cache,
+        uint64_t src_row_offset_bytes, uint32_t n_rows,
+        uint32_t head_dim, uint32_t bits) {
+    if (!out_f32 || !packed_cache || !ds4_rocm_tq_dim_supported(head_dim)) return 0;
+    if (n_rows == 0u) return 1;
+    const uint64_t row_bytes = ds4_gpu_kv_tq_packed_row_bytes(head_dim, bits);
+    if (row_bytes == 0 || !cuda_tensor_has_elems2(out_f32, n_rows, head_dim, sizeof(float)) ||
+        src_row_offset_bytes > packed_cache->bytes ||
+        (uint64_t)n_rows * row_bytes > packed_cache->bytes - src_row_offset_bytes) return 0;
+    const uint8_t *src = (const uint8_t *)packed_cache->ptr + src_row_offset_bytes;
+    tq_kv_unpack_rows_kernel<<<n_rows, head_dim, (size_t)head_dim * sizeof(float)>>>(
+            (float *)out_f32->ptr, src, row_bytes, n_rows, head_dim, bits);
+    return cuda_ok(cudaGetLastError(), "TurboQuant KV unpack launch");
+}
+
+extern "C" int ds4_gpu_tq_transform_tensor(
+        ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim, bool inverse) {
+    if (!x || !ds4_rocm_tq_dim_supported(head_dim) ||
+        !cuda_tensor_has_elems2(x, n_rows, head_dim, sizeof(float))) return 0;
+    if (n_rows == 0u) return 1;
+    tq_transform_rows_kernel<<<n_rows, head_dim, (size_t)head_dim * sizeof(float)>>>(
+            (float *)x->ptr, n_rows, head_dim, inverse ? 1u : 0u);
+    return cuda_ok(cudaGetLastError(), inverse ? "TurboQuant inverse transform launch"
+                                               : "TurboQuant forward transform launch");
+}
