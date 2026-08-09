@@ -271,6 +271,9 @@ static int attention_decode_batch_launch(
         (use_comp_mask && comp_mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float))) {
         return 0;
     }
+    // Multi-token batches require a nonzero compression ratio; the single-token
+    // decode API alone uses ratio=0 as a sentinel to read all compressed rows.
+    // Keep this guard strict so the two call contracts cannot be conflated.
     if (n_comp != 0 && ratio == 0) return 0;
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");

@@ -108,6 +108,13 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
 #include "ds4_gpu.h"
 #endif
 
+enum {
+    DS4_REAP_POLICY_NONE = 0,
+    DS4_REAP_POLICY_HASH_PRESERVED = 1,
+    DS4_REAP_POLICY_ROUTER_MASK_PRUNED = 2,
+    DS4_REAP_POLICY_MOE_DISABLED = 3,
+};
+
 /* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
  * stubs for the multi-GPU plumbing multi-GPU functions and globals declared in
  * ds4_gpu_mgpu.h. These keep the linker happy on Mac/Metal and on CPU
@@ -2303,6 +2310,32 @@ static bool model_get_array(const ds4_model *m, const char *key, ds4_array_ref *
     return true;
 }
 
+static bool model_get_u32_array_exact(const ds4_model *m, const char *key, uint32_t *out, uint64_t expected_len) {
+    ds4_array_ref arr;
+    if (!model_get_array(m, key, &arr)) return false;
+    if (arr.len != expected_len) {
+        fprintf(stderr, "ds4: metadata array %s has length %" PRIu64 ", expected %" PRIu64 "\n",
+                key, arr.len, expected_len);
+        exit(1);
+    }
+    if (arr.type != GGUF_VALUE_UINT32 && arr.type != GGUF_VALUE_INT32) {
+        fprintf(stderr, "ds4: metadata array %s has non-u32/i32 element type %u\n", key, arr.type);
+        exit(1);
+    }
+    ds4_cursor c = cursor_at(m, arr.data_pos);
+    for (uint64_t i = 0; i < arr.len; i++) {
+        if (arr.type == GGUF_VALUE_UINT32) {
+            if (!cursor_u32(&c, &out[i])) ds4_die(c.error);
+        } else {
+            int32_t v = 0;
+            if (!cursor_read(&c, &v, sizeof(v))) ds4_die(c.error);
+            if (v < 0) ds4_die("REAP metadata array contains a negative value");
+            out[i] = (uint32_t)v;
+        }
+    }
+    return true;
+}
+
 static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
@@ -4434,6 +4467,10 @@ typedef struct {
     ds4_tensor *nextn_enorm;
     ds4_tensor *nextn_hnorm;
     ds4_tensor *nextn_shared_head_norm;
+    uint32_t reap_policy;
+    uint32_t reap_expert_count;
+    uint32_t reap_keep_count;
+    bool reap_moe_disabled;
 } ds4_layer_weights;
 
 typedef struct {
@@ -4444,6 +4481,7 @@ typedef struct {
     ds4_tensor *output_norm;
     ds4_tensor *output;
     ds4_layer_weights layer[DS4_MAX_LAYER];
+    bool reap_compact_layout;
 } ds4_weights;
 
 typedef struct {
@@ -4957,7 +4995,8 @@ static ds4_gpu_stream_expert_table graph_stream_expert_table_make(
     table.model_map = model->map;
     table.model_size = model->size;
     table.layer = il;
-    table.n_total_expert = DS4_N_EXPERT;
+    table.n_total_expert = layer->ffn_gate_exps && layer->ffn_gate_exps->ndim >= 3 ?
+        (uint32_t)layer->ffn_gate_exps->dim[2] : DS4_N_EXPERT;
     table.gate_offset = layer->ffn_gate_exps ? layer->ffn_gate_exps->abs_offset : 0;
     table.up_offset = layer->ffn_up_exps ? layer->ffn_up_exps->abs_offset : 0;
     table.down_offset = layer->ffn_down_exps ? layer->ffn_down_exps->abs_offset : 0;
@@ -5197,6 +5236,21 @@ static bool weights_layers_bound(const ds4_weights *w, uint32_t layer_start, uin
     return true;
 }
 
+static uint32_t layer_stored_expert_count(const ds4_layer_weights *l) {
+    if (!l || l->reap_moe_disabled) return 0;
+    if (l->ffn_gate_exps && l->ffn_gate_exps->ndim >= 3 && l->ffn_gate_exps->dim[2] > 0 &&
+        l->ffn_gate_exps->dim[2] <= UINT32_MAX) return (uint32_t)l->ffn_gate_exps->dim[2];
+    return DS4_N_EXPERT;
+}
+
+static uint32_t weights_expected_layer_experts(const ds4_weights *w, const ds4_layer_weights *l) {
+    if (!w || !w->reap_compact_layout) return DS4_N_EXPERT;
+    if (!l || l->reap_moe_disabled) return 0;
+    if (l->reap_keep_count > 0) return l->reap_keep_count;
+    if (l->reap_expert_count > 0) return l->reap_expert_count;
+    return DS4_N_EXPERT;
+}
+
 static const ds4_layer_weights *weights_first_bound_layer(const ds4_weights *w) {
     if (!w) return NULL;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -5378,11 +5432,12 @@ static void weights_validate_layout(
         tensor_expect_layout(l->hc_ffn_scale,   DS4_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_ffn_base,    DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
         tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-        tensor_expect_layout(l->ffn_gate_inp,   DS4_TENSOR_F16,  2, DS4_N_EMBD, DS4_N_EXPERT, 0);
-        tensor_expect_optional(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
-        tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+        const uint32_t n_layer_expert = weights_expected_layer_experts(w, l);
+        tensor_expect_layout(l->ffn_gate_inp,   DS4_TENSOR_F16,  2, DS4_N_EMBD, n_layer_expert, 0);
+        tensor_expect_optional(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, n_layer_expert, 0, 0);
+        tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, n_layer_expert);
+        tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, n_layer_expert);
+        tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, n_layer_expert);
         if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
@@ -6226,6 +6281,48 @@ static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_
     }
 }
 
+static void weights_apply_reap_metadata(ds4_weights *w, const ds4_model *m) {
+    bool enabled = false;
+    if (!model_get_bool(m, "reap.enabled", &enabled) || !enabled) return;
+    ds4_str layout = {0};
+    if (!model_get_string(m, "reap.layout", &layout)) ds4_die("reap.enabled is true but reap.layout is missing");
+    if (!ds4_streq(layout, "ds4-compact-v1")) ds4_die("unsupported REAP layout (expected ds4-compact-v1)");
+    w->reap_compact_layout = true;
+
+    uint32_t policy[DS4_MAX_LAYER] = {0};
+    uint32_t expert_count[DS4_MAX_LAYER] = {0};
+    uint32_t keep_count[DS4_MAX_LAYER] = {0};
+    if (!model_get_u32_array_exact(m, "reap.layer.policy", policy, DS4_N_LAYER))
+        ds4_die("reap.enabled is true but reap.layer.policy is missing");
+    if (!model_get_u32_array_exact(m, "reap.layer.expert_count", expert_count, DS4_N_LAYER))
+        ds4_die("reap.enabled is true but reap.layer.expert_count is missing");
+    if (!model_get_u32_array_exact(m, "reap.layer.keep_count", keep_count, DS4_N_LAYER))
+        ds4_die("reap.enabled is true but reap.layer.keep_count is missing");
+
+    uint32_t hash = 0, router = 0, disabled = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_layer_weights *l = &w->layer[il];
+        l->reap_policy = policy[il];
+        l->reap_expert_count = expert_count[il];
+        l->reap_keep_count = keep_count[il];
+        l->reap_moe_disabled = policy[il] == DS4_REAP_POLICY_MOE_DISABLED;
+        if (keep_count[il] > expert_count[il] || expert_count[il] > DS4_N_EXPERT)
+            ds4_die("invalid REAP layer expert metadata");
+        switch (policy[il]) {
+            case DS4_REAP_POLICY_NONE: break;
+            case DS4_REAP_POLICY_HASH_PRESERVED: hash++; break;
+            case DS4_REAP_POLICY_ROUTER_MASK_PRUNED: router++; break;
+            case DS4_REAP_POLICY_MOE_DISABLED:
+                if (il < DS4_N_HASH_LAYER) ds4_die("REAP cannot disable a hash-routed layer");
+                disabled++;
+                break;
+            default: ds4_die("unsupported REAP layer policy");
+        }
+    }
+    fprintf(stderr, "ds4: REAP runtime metadata enabled: hash_preserved=%u router_masked=%u moe_disabled=%u layout=%.*s\n",
+            hash, router, disabled, (int)layout.len, layout.ptr);
+}
+
 /* Bind tensor names once into the fixed DS4 layer layout.  This is the point
  * where stringly GGUF metadata becomes direct model-specific pointers. */
 static void weights_bind(
@@ -6277,6 +6374,7 @@ static void weights_bind(
         }
     }
 
+    weights_apply_reap_metadata(w, m);
     weights_validate_layout(w, start, end, require_token_embd, require_output);
 }
 
@@ -10998,9 +11096,11 @@ static void layer_router_probs_one(
         const ds4_layer_weights * layer,
         const float       * x) {
     float logits[DS4_MAX_EXPERT];
+    const uint32_t n_expert = layer_stored_expert_count(layer);
+    if (n_expert == 0 || n_expert > DS4_N_EXPERT) ds4_die("bad layer router expert count");
 
     matvec_any(logits, model, layer->ffn_gate_inp, x);
-    for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
+    for (uint32_t i = 0; i < n_expert; i++) {
         probs[i] = sqrtf(softplus_stable(logits[i]));
     }
 }
@@ -11008,10 +11108,11 @@ static void layer_router_probs_one(
 static void layer_hash_router_weights_from_probs(
         float             weights_out[DS4_MAX_EXPERT_USED],
         const float       probs[DS4_MAX_EXPERT],
+        uint32_t          n_expert,
         const int          selected[DS4_MAX_EXPERT_USED]) {
     float sum = 0.0f;
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
-        if (selected[i] < 0 || (uint32_t)selected[i] >= DS4_N_EXPERT) ds4_die("hash-selected expert is outside router range");
+        if (selected[i] < 0 || (uint32_t)selected[i] >= n_expert) ds4_die("hash-selected expert is outside router range");
         weights_out[i] = probs[selected[i]];
         sum += weights_out[i];
     }
@@ -11031,7 +11132,7 @@ static void layer_hash_router_weights_one(
     float probs[DS4_MAX_EXPERT];
 
     layer_router_probs_one(probs, model, layer, x);
-    layer_hash_router_weights_from_probs(weights_out, probs, selected);
+    layer_hash_router_weights_from_probs(weights_out, probs, layer_stored_expert_count(layer), selected);
 }
 
 static void topk_desc(const float *score, int n, int k, int *idx) {
@@ -11075,16 +11176,18 @@ static void layer_topk_selected_experts_from_probs(
         const ds4_model       *model,
         const ds4_layer_weights *layer,
         const float           probs[DS4_MAX_EXPERT]) {
-    float selection[DS4_MAX_EXPERT];
+    float selection[DS4_MAX_EXPERT] = {0};
+    const uint32_t n_expert = layer_stored_expert_count(layer);
+    if (n_expert < DS4_N_EXPERT_USED || n_expert > DS4_N_EXPERT) ds4_die("bad layer top-k expert count");
 
-    memcpy(selection, probs, sizeof(selection));
+    memcpy(selection, probs, (size_t)n_expert * sizeof(selection[0]));
 
     if (layer->ffn_exp_probs_b) {
         const float *bias = tensor_data(model, layer->ffn_exp_probs_b);
-        for (uint32_t i = 0; i < DS4_N_EXPERT; i++) selection[i] += bias[i];
+        for (uint32_t i = 0; i < n_expert; i++) selection[i] += bias[i];
     }
 
-    topk_desc(selection, (int)DS4_N_EXPERT, (int)DS4_N_EXPERT_USED, selected);
+    topk_desc(selection, (int)n_expert, (int)DS4_N_EXPERT_USED, selected);
 
     float sum = 0.0f;
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
@@ -11404,6 +11507,7 @@ static void layer_routed_moe_batch(
         ds4_die("routed expert tensor layout is unexpected");
     }
 
+    const uint32_t n_layer_expert = layer_stored_expert_count(layer);
     const uint32_t total_pairs = n_tok * DS4_N_EXPERT_USED;
     uint32_t counts[DS4_MAX_EXPERT + 1] = {0};
     uint32_t cursor[DS4_MAX_EXPERT] = {0};
@@ -11429,12 +11533,12 @@ static void layer_routed_moe_batch(
             selected[pair_id] = sel[slot];
             pair_weight[pair_id] = weights[slot];
             pairs[pair_id] = (ds4_expert_pair){ .token = t, .slot = slot };
-            if (sel[slot] < 0 || (uint32_t)sel[slot] >= DS4_N_EXPERT) ds4_die("selected expert is outside range");
+            if (sel[slot] < 0 || (uint32_t)sel[slot] >= n_layer_expert) ds4_die("selected expert is outside range");
             counts[(uint32_t)sel[slot] + 1]++;
         }
     }
 
-    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+    for (uint32_t e = 0; e < n_layer_expert; e++) {
         counts[e + 1] += counts[e];
         cursor[e] = counts[e];
         if (counts[e + 1] != counts[e]) active_expert[n_active++] = e;
@@ -21214,13 +21318,14 @@ static bool metal_graph_decode_cpu_router(
     int32_t selected_i32[DS4_MAX_EXPERT_USED];
     float weights[DS4_MAX_EXPERT_USED];
 
+    const uint32_t n_layer_expert = layer_stored_expert_count(layer);
     matvec_any(logits, model, layer->ffn_gate_inp, g->cpu_router_norm);
-    for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
+    for (uint32_t i = 0; i < n_layer_expert; i++) {
         probs[i] = sqrtf(softplus_stable(logits[i]));
     }
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, (int)token);
-        layer_hash_router_weights_from_probs(weights, probs, selected);
+        layer_hash_router_weights_from_probs(weights, probs, n_layer_expert, selected);
     } else {
         layer_topk_selected_experts_from_probs(selected, weights, model, layer, probs);
     }
@@ -22098,6 +22203,8 @@ static bool metal_graph_encode_decode_layer_phase(
     const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
     const uint32_t rank = DS4_N_LORA_O;
     const uint32_t shared_dim = (uint32_t)layer->ffn_gate_shexp->dim[1];
+    const uint32_t router_experts = layer_stored_expert_count(layer);
+    if (router_experts < DS4_N_EXPERT_USED || router_experts > DS4_N_EXPERT) return false;
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
@@ -23401,14 +23508,14 @@ static bool metal_graph_encode_decode_layer_phase(
     } else {
         if (ok && !metal_graph_tp_ablate("router")) {
         ok = metal_graph_matmul_plain_tensor(metal_graph_router_logits(g), model, layer->ffn_gate_inp,
-                                                     DS4_N_EMBD, DS4_N_EXPERT, metal_graph_ffn_norm(g), 1);
+                                                     DS4_N_EMBD, router_experts, metal_graph_ffn_norm(g), 1);
         if (ok) ok = ds4_gpu_router_select_tensor(metal_graph_router_selected(g), metal_graph_router_weights(g), metal_graph_router_probs(g),
                                                     model->map, model->size,
                                                     layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
                                                     layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
                                                     layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
                                                     (uint32_t)token,
-                                                    DS4_N_EXPERT,
+                                                    router_experts,
                                                     DS4_N_EXPERT_USED,
                                                     DS4_EXPERT_WEIGHT_SCALE,
                                                     0,
@@ -23428,8 +23535,8 @@ static bool metal_graph_encode_decode_layer_phase(
     DS4_METAL_PROFILE_DECODE_STAGE("router");
     if (ok) ok = metal_graph_profile_router_selection(g, layer, il, pos);
     if (ok) {
-        metal_graph_debug_dump_tensor("ffn_moe_logits", metal_graph_router_logits(g), DS4_N_EXPERT, il, pos);
-        metal_graph_debug_dump_tensor("ffn_moe_probs", metal_graph_router_probs(g), DS4_N_EXPERT, il, pos);
+        metal_graph_debug_dump_tensor("ffn_moe_logits", metal_graph_router_logits(g), router_experts, il, pos);
+        metal_graph_debug_dump_tensor("ffn_moe_probs", metal_graph_router_probs(g), router_experts, il, pos);
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", metal_graph_router_selected(g), DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", metal_graph_router_weights(g), DS4_N_EXPERT_USED, il, pos);
     }
@@ -23695,10 +23802,10 @@ static bool metal_graph_encode_decode_layer_phase(
                         (uint32_t)routed_out_dim,
                         peer_selected,
                         peer_weights,
-                        DS4_N_EXPERT,
+                        router_experts,
                         tp_experts,
-                        DS4_N_EXPERT / 2u,
-                        DS4_N_EXPERT - DS4_N_EXPERT / 2u,
+                        router_experts / 2u,
+                        router_experts - router_experts / 2u,
                         DS4_SWIGLU_CLAMP_EXP,
                         peer_ffn_norm,
                         peer_down_output,
@@ -23726,7 +23833,7 @@ static bool metal_graph_encode_decode_layer_phase(
                         (uint32_t)routed_out_dim,
                         peer_selected,
                         peer_weights,
-                        DS4_N_EXPERT,
+                        router_experts,
                         tp_experts,
                         DS4_SWIGLU_CLAMP_EXP,
                         peer_ffn_norm, NULL, 0, false) != 0;
@@ -23748,7 +23855,7 @@ static bool metal_graph_encode_decode_layer_phase(
                     cuda_tp_ep_dual_prequant
                         ? g->shared_gate_by_tier[cuda_tp_partner_tier]
                         : NULL,
-                    DS4_N_EXPERT / 2u,
+                    router_experts / 2u,
                     false) != 0;
         }
 #endif
@@ -23776,10 +23883,10 @@ static bool metal_graph_encode_decode_layer_phase(
                         (uint32_t)routed_out_dim,
                         &local_selected,
                         &local_weights,
-                        DS4_N_EXPERT,
+                        router_experts,
                         tp_experts,
                         0,
-                        DS4_N_EXPERT / 2u,
+                        router_experts / 2u,
                         DS4_SWIGLU_CLAMP_EXP,
                         metal_graph_ffn_norm(g),
                         NULL,
@@ -23807,7 +23914,7 @@ static bool metal_graph_encode_decode_layer_phase(
                         (uint32_t)routed_out_dim,
                         &local_selected,
                         &local_weights,
-                        DS4_N_EXPERT,
+                        router_experts,
                         tp_experts,
                         DS4_SWIGLU_CLAMP_EXP,
                         metal_graph_ffn_norm(g), NULL, 0, false) != 0;
@@ -23829,7 +23936,7 @@ static bool metal_graph_encode_decode_layer_phase(
                     cuda_tp_ep_dual_prequant
                         ? metal_graph_shared_gate(g)
                         : NULL,
-                    DS4_N_EXPERT / 2u,
+                    router_experts / 2u,
                     true) != 0;
         }
 #endif
@@ -23986,7 +24093,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                      (uint32_t)down_in_dim,
                                                      (uint32_t)routed_out_dim,
                                                      metal_graph_router_selected(g), metal_graph_router_weights(g),
-                                                     DS4_N_EXPERT,
+                                                     router_experts,
                                                      DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, metal_graph_ffn_norm(g),
                                                      NULL,
                                                      il,
@@ -24192,7 +24299,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                      (uint32_t)down_in_dim,
                                                      (uint32_t)routed_out_dim,
                                                      metal_graph_router_selected(g), metal_graph_router_weights(g),
-                                                     DS4_N_EXPERT,
+                                                     router_experts,
                                                      DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, metal_graph_ffn_norm(g),
                                                      NULL,
                                                      il,
@@ -24284,7 +24391,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                  (uint32_t)down_in_dim,
                                                  (uint32_t)routed_out_dim,
                                                  metal_graph_router_selected(g), metal_graph_router_weights(g),
-                                                 DS4_N_EXPERT,
+                                                 router_experts,
                                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, metal_graph_ffn_norm(g),
                                                  NULL,
                                                  il,
@@ -24460,7 +24567,7 @@ static bool metal_graph_encode_decode_layer_phase(
                 metal_graph_routed_down(g),
                 g->tp_peer_tmp_by_tier[cuda_tp_home_tier],
                 metal_graph_router_selected(g),
-                DS4_N_EXPERT / 2u,
+                router_experts / 2u,
                 metal_graph_after_attn_hc(g),
                 metal_graph_hc_split(g),
                 DS4_N_EMBD,
@@ -24540,7 +24647,7 @@ static bool metal_graph_encode_decode_layer_phase(
                 (uint32_t)down_in_dim,
                 (uint32_t)routed_out_dim,
                 metal_graph_router_selected(g), metal_graph_router_weights(g),
-                DS4_N_EXPERT,
+                router_experts,
                 DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, metal_graph_ffn_norm(g),
                 metal_graph_shared_out(g),
                 il,
@@ -29160,6 +29267,8 @@ static bool metal_graph_encode_layer_ffn_batch(
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
+    const uint32_t router_experts = layer_stored_expert_count(layer);
+    if (router_experts < DS4_N_EXPERT_USED || router_experts > DS4_N_EXPERT) return false;
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
@@ -29265,7 +29374,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                  model,
                                                  layer->ffn_gate_inp,
                                                  DS4_N_EMBD,
-                                                 DS4_N_EXPERT,
+                                                 router_experts,
                                                  metal_graph_batch_ffn_norm(g),
                                                  n_tokens);
 
@@ -29290,16 +29399,16 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                       layer->ffn_gate_tid2eid != NULL,
                                                       metal_graph_batch_router_logits(g),
                                                       metal_graph_prefill_tokens(g),
-                                                      DS4_N_EXPERT,
+                                                      router_experts,
                                                       DS4_N_EXPERT_USED,
                                                       DS4_EXPERT_WEIGHT_SCALE,
                                                       n_tokens) != 0;
     ds4_gpu_tensor_free(router_tokens);
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", metal_graph_batch_router_logits(g),
-                                      (uint64_t)n_tokens * DS4_N_EXPERT, il, pos0);
+                                      (uint64_t)n_tokens * router_experts, il, pos0);
         metal_graph_debug_dump_tensor("ffn_moe_probs", metal_graph_batch_router_probs(g),
-                                      (uint64_t)n_tokens * DS4_N_EXPERT, il, pos0);
+                                      (uint64_t)n_tokens * router_experts, il, pos0);
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", metal_graph_batch_router_selected(g),
                                           (uint64_t)n_tokens * DS4_N_EXPERT_USED, il, pos0);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", metal_graph_batch_router_weights(g),
@@ -29583,7 +29692,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                (uint32_t)down_in_dim,
                                                (uint32_t)routed_out_dim,
                                                sel_row, w_row,
-                                               DS4_N_EXPERT,
+                                               router_experts,
                                                DS4_N_EXPERT_USED,
                                                DS4_SWIGLU_CLAMP_EXP,
                                                x_row,
@@ -29624,7 +29733,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                (uint32_t)routed_out_dim,
                                                metal_graph_batch_router_selected(g),
                                                metal_graph_batch_router_weights(g),
-                                               DS4_N_EXPERT,
+                                               router_experts,
                                                DS4_N_EXPERT_USED,
                                                DS4_SWIGLU_CLAMP_EXP,
                                                metal_graph_batch_ffn_norm(g),

@@ -808,6 +808,43 @@ session-based protocol that can recreate all that in a client-server way.
 
 ## Benchmarking
 
+For reproducible KV-cache A/B quality measurements (F16, FP8, Q8, TQ4 and
+TQ2), use the persistent-server harness:
+
+```sh
+python3 tools/quality_bench.py --model ds4flash.gguf \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --long-prompt-file tests/long_context_story_prompt.txt \
+  --session-restore --output quality-bench.json
+```
+
+The harness starts one server per quantization/topology/implementation variant,
+then sends all short/long and cache-warm requests before stopping it; model
+loading is therefore outside the case timing loop. On ROCm UMA, diagnostics
+also sample Linux system RAM (`/proc/meminfo`) because VRAM telemetry alone is
+insufficient. When `--session-restore` is enabled, the long case is restored
+and compared when supplied (otherwise the short case is used). JSON results
+keep output
+hashes/exact-match quality separate from latency, estimated prefill/decode
+throughput, cache-hit tokens, VRAM/system-RAM samples and crash status.
+`--dry-run` prints
+the exact commands without loading a model. Defaults are conservative
+(`--ctx 32768`, `--prefill-chunk 512`, 32 generated tokens); increase them only
+after checking available VRAM. `--topology both` adds a CUDA tensor-parallel
+run, and `--upstream-binary PATH` compares the normal F16 path with a reference
+binary (the upstream variant is intentionally F16-only; quantized modes are
+run only for the integrated binary). Use a distinct `--port` when another
+server is already running.
+
+These mode flags select the KV-cache representation, not the GGUF weight
+quantization. F16 is the uncompressed cache baseline; FP8/Q8/TQ4/TQ2 are
+mutually exclusive process configurations because the server selects the cache
+at startup. Consequently `--kv-cache-tq4` is passed on every TQ4 run, while
+combining it with the other modes would make the comparison meaningless.
+The model-free smoke test is `python3 -m unittest tools/test_quality_bench.py`.
+The reported token rates divide by total HTTP time (prefill plus decode), so
+they are estimates rather than isolated prefill timings.
+
 `ds4-bench` measures instantaneous prefill and generation throughput at context
 frontiers instead of reporting one whole-run average. It loads the model once,
 walks a fixed token sequence to frontiers such as 2048, 4096, 6144, and uses
