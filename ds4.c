@@ -4494,6 +4494,9 @@ typedef struct {
     ds4_tensor *hc_head_fn;
     ds4_tensor *hc_head_scale;
     ds4_layer_weights block;
+    /* Legacy MTP support GGUFs may use a compact expert table (for example
+     * the K160 REAP support model) while the target model remains K256. */
+    uint32_t n_expert;
 } ds4_mtp_weights;
 
 typedef struct {
@@ -5452,6 +5455,10 @@ static void weights_validate_layout(
 }
 
 static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
+    if (!w || w->n_expert < DS4_N_EXPERT_USED || w->n_expert > DS4_MAX_EXPERT) {
+        ds4_die("legacy MTP has an invalid routed expert count");
+    }
+    const uint32_t n_expert = w->n_expert;
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
     const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
@@ -5484,11 +5491,11 @@ static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
     tensor_expect_layout(l->hc_ffn_scale,   DS4_TENSOR_F32,  1, 3, 0, 0);
     tensor_expect_layout(l->hc_ffn_base,    DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
     tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_plain_layout(l->ffn_gate_inp, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
-    tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
-    tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-    tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-    tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+    tensor_expect_plain_layout(l->ffn_gate_inp, 2, DS4_N_EMBD, n_expert, 0);
+    tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, n_expert, 0, 0);
+    tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, n_expert);
+    tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, n_expert);
+    tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, n_expert);
     if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
         ds4_die("MTP routed gate/up experts use different quant types");
     }
@@ -6927,6 +6934,37 @@ static DS4_MAYBE_UNUSED bool weights_model_map_output_spans(
     return model_map_span_vec_finish(spans);
 }
 
+static uint32_t mtp_tensor_expert_count(const ds4_tensor *tensor,
+                                         const char      *name,
+                                         uint32_t         dim) {
+    if (!tensor || dim >= tensor->ndim || tensor->dim[dim] == 0 ||
+        tensor->dim[dim] > DS4_MAX_EXPERT) {
+        fprintf(stderr, "ds4: legacy MTP tensor %s has an invalid expert dimension\n", name);
+        exit(1);
+    }
+    return (uint32_t)tensor->dim[dim];
+}
+
+static uint32_t mtp_weights_derive_expert_count(const ds4_layer_weights *layer) {
+    const uint32_t router = mtp_tensor_expert_count(
+        layer->ffn_gate_inp, "mtp.0.ffn_gate_inp.weight", 1);
+    const uint32_t bias = mtp_tensor_expert_count(
+        layer->ffn_exp_probs_b, "mtp.0.exp_probs_b.bias", 0);
+    const uint32_t gate = mtp_tensor_expert_count(
+        layer->ffn_gate_exps, "mtp.0.ffn_gate_exps.weight", 2);
+    const uint32_t up = mtp_tensor_expert_count(
+        layer->ffn_up_exps, "mtp.0.ffn_up_exps.weight", 2);
+    const uint32_t down = mtp_tensor_expert_count(
+        layer->ffn_down_exps, "mtp.0.ffn_down_exps.weight", 2);
+    if (router != bias || router != gate || router != up || router != down) {
+        ds4_die("legacy MTP router, bias, and expert tensors disagree on expert count");
+    }
+    if (router < DS4_N_EXPERT_USED) {
+        ds4_die("legacy MTP expert count is smaller than the routed top-k");
+    }
+    return router;
+}
+
 static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
 
@@ -6964,6 +7002,7 @@ static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
     l->ffn_gate_shexp  = required_tensor(m, "mtp.0.ffn_gate_shexp.weight");
     l->ffn_up_shexp    = required_tensor(m, "mtp.0.ffn_up_shexp.weight");
     l->ffn_down_shexp  = required_tensor(m, "mtp.0.ffn_down_shexp.weight");
+    w->n_expert = mtp_weights_derive_expert_count(l);
 
     mtp_weights_validate_layout(w);
 }
@@ -15672,6 +15711,10 @@ typedef struct {
     ds4_gpu_tensor *mtp_next_hc;
     ds4_gpu_tensor *mtp_raw_cache;
     uint32_t mtp_n_raw;
+    /* Non-zero only while the graph is executing a standalone legacy MTP
+     * support model.  This is intentionally separate from DS4_N_EXPERT,
+     * which describes the target model and its REAP metadata. */
+    uint32_t active_support_n_expert;
     uint32_t prefill_cap;
     uint32_t raw_window;
     uint32_t batch_token_offset;
@@ -15799,6 +15842,17 @@ typedef struct {
     ds4_gpu_tensor *tp_zero;
     ds4_gpu_tensor *tp_logits_half;
 } ds4_gpu_graph;
+
+static uint32_t metal_graph_active_expert_count(
+        const ds4_gpu_graph       *g,
+        const ds4_layer_weights   *layer) {
+    const uint32_t stored = layer_stored_expert_count(layer);
+    if (!g || g->active_support_n_expert == 0) return stored;
+    if (stored != 0 && stored != g->active_support_n_expert) {
+        ds4_die("legacy MTP support expert count disagrees with routed tensors");
+    }
+    return g->active_support_n_expert;
+}
 
 /* Tensors that are temporary for chunked prefill and grouped multi-session
  * decode. The batched server serializes every operation that uses them, so one
@@ -21318,7 +21372,8 @@ static bool metal_graph_decode_cpu_router(
     int32_t selected_i32[DS4_MAX_EXPERT_USED];
     float weights[DS4_MAX_EXPERT_USED];
 
-    const uint32_t n_layer_expert = layer_stored_expert_count(layer);
+    const uint32_t n_layer_expert = metal_graph_active_expert_count(g, layer);
+    if (n_layer_expert < DS4_N_EXPERT_USED || n_layer_expert > DS4_MAX_EXPERT) return false;
     matvec_any(logits, model, layer->ffn_gate_inp, g->cpu_router_norm);
     for (uint32_t i = 0; i < n_layer_expert; i++) {
         probs[i] = sqrtf(softplus_stable(logits[i]));
@@ -21386,8 +21441,9 @@ static bool metal_graph_decode_selected_readahead_override(
         uint32_t                  il,
         uint64_t                  gate_expert_bytes,
         uint64_t                  down_expert_bytes) {
+    const uint32_t n_layer_expert = metal_graph_active_expert_count(g, layer);
     if (!g || !model || !layer || !metal_graph_router_selected(g) ||
-        DS4_N_EXPERT == 0 || DS4_N_EXPERT > DS4_MAX_EXPERT ||
+        n_layer_expert == 0 || n_layer_expert > DS4_MAX_EXPERT ||
         DS4_N_EXPERT_USED == 0 || DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED) {
         return false;
     }
@@ -21410,11 +21466,11 @@ static bool metal_graph_decode_selected_readahead_override(
     bool seen[DS4_MAX_EXPERT] = {0};
     uint32_t unique = 0;
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
-        if (selected_ids[i] < 0 || (uint32_t)selected_ids[i] >= DS4_N_EXPERT) {
+        if (selected_ids[i] < 0 || (uint32_t)selected_ids[i] >= n_layer_expert) {
             fprintf(stderr,
                     "ds4: Metal streaming selected readahead expert id %d is outside 0..%u at layer %u\n",
                     selected_ids[i],
-                    DS4_N_EXPERT,
+                    n_layer_expert,
                     il);
             return false;
         }
@@ -22203,8 +22259,8 @@ static bool metal_graph_encode_decode_layer_phase(
     const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
     const uint32_t rank = DS4_N_LORA_O;
     const uint32_t shared_dim = (uint32_t)layer->ffn_gate_shexp->dim[1];
-    const uint32_t router_experts = layer_stored_expert_count(layer);
-    if (router_experts < DS4_N_EXPERT_USED || router_experts > DS4_N_EXPERT) return false;
+    const uint32_t router_experts = metal_graph_active_expert_count(g, layer);
+    if (router_experts < DS4_N_EXPERT_USED || router_experts > DS4_MAX_EXPERT) return false;
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
@@ -29267,8 +29323,8 @@ static bool metal_graph_encode_layer_ffn_batch(
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
-    const uint32_t router_experts = layer_stored_expert_count(layer);
-    if (router_experts < DS4_N_EXPERT_USED || router_experts > DS4_N_EXPERT) return false;
+    const uint32_t router_experts = metal_graph_active_expert_count(g, layer);
+    if (router_experts < DS4_N_EXPERT_USED || router_experts > DS4_MAX_EXPERT) return false;
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
@@ -33076,6 +33132,11 @@ static bool metal_graph_eval_mtp_draft_from_hc(
     ds4_gpu_tensor *saved_after = metal_graph_after_ffn_hc(g);
     const uint32_t saved_tp_world = g->tp_world;
     const uint32_t saved_tp_batch_rows = g->tp_batch_rows;
+    const uint32_t saved_support_n_expert = g->active_support_n_expert;
+    if (mtp->n_expert < DS4_N_EXPERT_USED || mtp->n_expert > DS4_MAX_EXPERT) {
+        return false;
+    }
+    g->active_support_n_expert = mtp->n_expert;
     g->tp_world = 0;
     g->tp_batch_rows = 0;
     const bool suspended_expert_sharding = saved_tp_world == 2;
@@ -33172,6 +33233,7 @@ static bool metal_graph_eval_mtp_draft_from_hc(
     if (ok && g->mtp_n_raw < g->raw_window) g->mtp_n_raw++;
     g->tp_world = saved_tp_world;
     g->tp_batch_rows = saved_tp_batch_rows;
+    g->active_support_n_expert = saved_support_n_expert;
     if (!ok) {
         (void)ds4_gpu_synchronize();
         g->cur_hc_by_tier[g->active_tier] = saved_cur;
