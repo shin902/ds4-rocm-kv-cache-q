@@ -1870,6 +1870,12 @@ static const dspark_name_rule dspark_stage_rules[] = {
     {"ffn.shared_experts.w2.weight", "ffn_down_shexp.weight", "emit"},
     {"ffn.shared_experts.w2.scale", "ffn_down_shexp.weight", "consume_scale"},
 
+    {"e_proj.weight", "e_proj.weight", "emit"},
+    {"e_proj.scale", "e_proj.weight", "consume_scale"},
+    {"enorm.weight", "enorm.weight", "emit"},
+    {"h_proj.weight", "h_proj.weight", "emit"},
+    {"h_proj.scale", "h_proj.weight", "consume_scale"},
+    {"hnorm.weight", "hnorm.weight", "emit"},
     {"main_proj.weight", "main_proj.weight", "emit"},
     {"main_proj.scale", "main_proj.weight", "consume_scale"},
     {"main_norm.weight", "main_norm.weight", "emit"},
