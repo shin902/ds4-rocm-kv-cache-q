@@ -27,6 +27,7 @@
 /tests/test_q4k_dot
 /tests/test_sampling
 *.o
+bench-results/
 *.dSYM/
 __pycache__/
 *.pyc
